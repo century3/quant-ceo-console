@@ -12,6 +12,7 @@ description: "投研分析技能索引 -- 根据用户需求选择合适的技�
 | 写研报/深度分析/五步法 | write-report | web-search, read-pdf, financial-analysis |
 | 查最新股价/行情/走势 | stock-price | - |
 | 采集美股日线/更新美股行情库 | us-stock-collect | - |
+| 美股未来 N 日涨幅超过阈值的概率 | stock-rebound-forecast | - |
 | 搜最新新闻/政策/评级 | web-search | - |
 | 读财报PDF/查报告数据 | read-pdf | - |
 | 分析财务指标/ROE/负债率 | financial-analysis | read-pdf(获取数据) |

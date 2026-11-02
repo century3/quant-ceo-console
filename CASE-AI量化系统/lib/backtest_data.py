@@ -22,6 +22,7 @@ qmt/miniqmt 直拉券商；tdx 读已经灌好的 MySQL。
 
 from __future__ import annotations
 import os
+import re
 import warnings
 from functools import lru_cache
 from pathlib import Path
@@ -258,9 +259,85 @@ def clear_kline_cache():
 # 映射表: wucai_trade.trade_stock_status (stock_code -> stock_name)
 # ============================================================
 
+def _us_collector_path() -> Path:
+    """美股采集脚本。中文名写在 SYMBOLS 行尾注释里，不执行该文件。"""
+    return (Path(__file__).resolve().parents[3]
+            / "4-数据获取与清洗" / "CASE-数据采集" / "8-美股行情采集-yahoo.py")
+
+
+@lru_cache(maxsize=1)
+def _us_display_names() -> dict:
+    """入库代码 -> 采集脚本注释里的简称。没有注释的代码不在这张表里。"""
+    path = _us_collector_path()
+    names: dict[str, str] = {}
+    line_re = re.compile(
+        r"\(\s*'[^']+'\s*,\s*'([^']+\.US)'\s*\)\s*,?\s*(?:#\s*(.*))?$"
+    )
+    if not path.is_file():
+        return names
+    for line in path.read_text(encoding="utf-8").splitlines():
+        matched = line_re.search(line.strip())
+        if not matched:
+            continue
+        comment = (matched.group(2) or "").strip()
+        if not comment:
+            continue
+        name = re.split(r"[，,]", comment, maxsplit=1)[0].strip()
+        if name:
+            names[matched.group(1).upper()] = name
+    return names
+
+
+@lru_cache(maxsize=1)
+def _us_codes() -> tuple:
+    """库里出现过的美股代码。"""
+    try:
+        import pymysql
+        conn = pymysql.connect(connect_timeout=2, **_db_config())
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT DISTINCT stock_code FROM trade_stock_us_daily")
+            rows = cursor.fetchall() or []
+            cursor.close()
+        finally:
+            conn.close()
+    except Exception:
+        return tuple()
+    return tuple(sorted(str(row[0]).upper() for row in rows if row and row[0]))
+
+
+def _search_us_stocks(keyword: str, limit: int) -> list[dict]:
+    """按代码或采集注释里的中文名搜索美股。"""
+    q = (keyword or "").strip()
+    if not q:
+        return []
+    qu = q.upper()
+    names = _us_display_names()
+    scored = []
+    for code in _us_codes():
+        ticker = code[:-3] if code.endswith(".US") else code
+        name = names.get(code, "")
+        if code == qu or ticker == qu:
+            rank = 0
+        elif ticker.startswith(qu) or code.startswith(qu):
+            rank = 1
+        elif name and name == q:
+            rank = 2
+        elif name and q in name:
+            rank = 3
+        else:
+            continue
+        scored.append((rank, code, name))
+    scored.sort(key=lambda item: (item[0], item[1]))
+    return [{"code": code, "name": name} for _, code, name in scored[:limit]]
+
+
 @lru_cache(maxsize=512)
 def get_stock_name(stock_code: str) -> str:
-    """从 trade_stock_status 取股票中文简称, 取不到返 code"""
+    """A 股从 trade_stock_status 取简称；美股用采集脚本注释。取不到返 code。"""
+    code = (stock_code or "").strip()
+    if code.upper().endswith(".US"):
+        return _us_display_names().get(code.upper()) or code
     try:
         import pymysql
         conn = pymysql.connect(connect_timeout=2, **_db_config())
@@ -302,6 +379,11 @@ def get_stock_names(stock_codes: list[str]) -> dict[str, str]:
                 if code and name:
                     out[str(code)] = str(name).strip()
             cursor.close()
+            us_names = _us_display_names()
+            for code in codes:
+                us_name = us_names.get(str(code).upper())
+                if us_name:
+                    out[code] = us_name
         finally:
             conn.close()
     except Exception:
@@ -310,10 +392,11 @@ def get_stock_names(stock_codes: list[str]) -> dict[str, str]:
 
 
 def search_stocks(keyword: str, limit: int = 20) -> list[dict]:
-    """按代码或中文名模糊搜索 trade_stock_status.
+    """按代码或中文名搜索 A 股和美股。
 
+    A 股来自 trade_stock_status。美股来自 trade_stock_us_daily，
+    中文名来自采集脚本注释。中文关键词先给 A 股，字母代码先给美股。
     返回: [{"code": "603986.SH", "name": "兆易创新"}, ...]
-    匹配优先级: 代码精确 > 名称精确 > 代码前缀 > 名称包含.
     """
     q = (keyword or "").strip()
     if not q:
@@ -347,14 +430,27 @@ def search_stocks(keyword: str, limit: int = 20) -> list[dict]:
             cursor.close()
         finally:
             conn.close()
-        out = []
+        a_hits = []
         for code, name, *_ in rows:
             if not code:
                 continue
-            out.append({"code": str(code), "name": str(name or "").strip()})
-        return out
+            a_hits.append({"code": str(code), "name": str(name or "").strip()})
     except Exception:
-        return []
+        a_hits = []
+    us_hits = _search_us_stocks(q, limit)
+    has_cjk = bool(re.search(r"[\u4e00-\u9fff]", q))
+    first, second = (a_hits, us_hits) if has_cjk else (us_hits, a_hits)
+    seen = set()
+    merged = []
+    for item in first + second:
+        code = item["code"]
+        if code in seen:
+            continue
+        seen.add(code)
+        merged.append(item)
+        if len(merged) >= limit:
+            break
+    return merged
 
 
 def format_stock_label(code: str, name: str = "") -> str:

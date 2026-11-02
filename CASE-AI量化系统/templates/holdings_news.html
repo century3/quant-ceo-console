@@ -1,0 +1,200 @@
+{% extends "base.html" %}
+{% block title %}持仓舆情 -- AI 量化系统{% endblock %}
+
+{% block content %}
+<div x-data="holdingsNewsApp()" x-init="init()">
+
+    <button class="help-btn-floating" @click="showHelp = true" title="使用说明">?</button>
+
+    <div class="modal-overlay" x-show="showHelp" x-cloak @click.self="showHelp = false">
+        <div class="modal-card">
+            <div class="modal-header">
+                <div class="modal-title">持仓舆情 -- 使用说明</div>
+                <button class="modal-close" @click="showHelp = false">×</button>
+            </div>
+            <div class="modal-body">
+                <h4>看什么</h4>
+                <p>按模拟盘当前持仓，抓最近几天的新闻，再用舆情技能里的关键词表标出利好、利空和政策事件。只看标题，「不减持」不会当成减持。事件识别不下单。</p>
+                <h4>新闻从哪来</h4>
+                <ul>
+                    <li>A 股：东方财富个股新闻，和投研对话里的 sentiment-analysis 技能同一条抓取。</li>
+                    <li>美股：Yahoo 头条，标题和摘要用通义译成中文。英文原标题仍用来对英文关键词。</li>
+                </ul>
+                <h4>操作</h4>
+                <ul>
+                    <li><b>刷新持仓舆情</b>：按当前持仓重新抓。</li>
+                    <li><b>用最近缓存</b>：打开上次结果，不再请求新闻源。</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+
+    <div class="grid-2">
+        <div class="flex-col">
+            <div class="card" x-show="status">
+                <div class="card-header">
+                    <div class="card-title">运行状态</div>
+                    <div class="card-subtitle" x-text="savedAt ? ('保存于 ' + savedAt) : ''"></div>
+                </div>
+                <div class="text-sm text-gray-600" x-text="status"></div>
+            </div>
+
+            <template x-if="holdings.length === 0">
+                <div class="card">
+                    <div class="text-gray-400 text-sm py-6 text-center">
+                        点右侧「刷新持仓舆情」或「用最近缓存」
+                    </div>
+                </div>
+            </template>
+
+            <template x-for="row in holdings" :key="row.code">
+                <div class="card">
+                    <div class="card-header">
+                        <div>
+                            <div class="card-title" x-text="row.name + ' (' + row.code + ')'"></div>
+                            <div class="card-subtitle" x-text="'持仓 ' + row.volume + ' 股 · 新闻 ' + (row.news || []).length + ' 条 · 事件 ' + (row.events || []).length + ' 条'"></div>
+                        </div>
+                    </div>
+                    <div x-show="row.error" class="text-sm text-rose-700 mb-2" x-text="row.error"></div>
+                    <template x-if="(row.events || []).length > 0">
+                        <table class="app-table mb-3">
+                            <thead><tr>
+                                <th>时间</th><th>类型</th><th>事件</th><th>信号</th><th>新闻</th>
+                            </tr></thead>
+                            <tbody>
+                                <template x-for="(ev, idx) in row.events" :key="row.code + '-ev-' + idx">
+                                    <tr>
+                                        <td class="text-xs" x-text="ev.time || '—'"></td>
+                                        <td :class="ev.event_type === '利好' ? 'pos' : (ev.event_type === '利空' ? 'neg' : '')" x-text="ev.event_type"></td>
+                                        <td x-text="ev.event_category"></td>
+                                        <td x-text="ev.signal"></td>
+                                        <td>
+                                            <a x-show="ev.url" :href="ev.url" target="_blank" rel="noopener" class="text-indigo-700" x-text="ev.title"></a>
+                                            <span x-show="!ev.url" x-text="ev.title"></span>
+                                        </td>
+                                    </tr>
+                                </template>
+                            </tbody>
+                        </table>
+                    </template>
+                    <template x-if="(row.news || []).length === 0 && !row.error">
+                        <div class="text-gray-400 text-sm">这个区间没有新闻</div>
+                    </template>
+                    <template x-for="(news, idx) in row.news" :key="row.code + '-n-' + idx">
+                        <div class="py-2 border-t border-gray-100">
+                            <a x-show="news.url" :href="news.url" target="_blank" rel="noopener" class="text-sm text-indigo-700" x-text="news.title"></a>
+                            <div x-show="!news.url" class="text-sm" x-text="news.title"></div>
+                            <div class="text-xs text-gray-500 mt-1" x-text="[news.time, news.source].filter(Boolean).join(' · ')"></div>
+                            <div class="text-xs text-gray-600 mt-1" x-show="news.summary" x-text="news.summary"></div>
+                        </div>
+                    </template>
+                </div>
+            </template>
+        </div>
+
+        <div class="flex-col">
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-title">刷新</div>
+                </div>
+                <div class="form-row">
+                    <label class="form-label">最近天数</label>
+                    <select class="form-control" x-model.number="days">
+                        <option value="3">3 天</option>
+                        <option value="7">7 天</option>
+                        <option value="14">14 天</option>
+                    </select>
+                </div>
+                <div class="flex gap-2 mt-4">
+                    <button class="btn btn-primary flex-1" :disabled="running" @click="refresh()">
+                        <span x-show="!running">刷新持仓舆情</span>
+                        <span x-show="running">抓取中...</span>
+                    </button>
+                    <button class="btn btn-secondary" :disabled="running" @click="loadCache()">用最近缓存</button>
+                </div>
+                <p class="text-xs text-gray-500 mt-3">持仓来自模拟盘当前账面。卖掉的股票不会出现在这里。</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+function holdingsNewsApp() {
+    return {
+        showHelp: false,
+        running: false,
+        days: 7,
+        status: '',
+        savedAt: '',
+        holdings: [],
+
+        init() {
+            this.loadCache(true);
+        },
+
+        applyPayload(payload) {
+            this.holdings = payload.holdings || [];
+            this.savedAt = payload.saved_at || '';
+            if (payload.days) this.days = payload.days;
+        },
+
+        async loadCache(silent = false) {
+            const r = await App.get('/api/holdings-news/cache');
+            if (r.error) {
+                if (!silent) App.toast(r.error, 'warn');
+                return;
+            }
+            this.applyPayload(r);
+            this.status = '已载入最近一次结果';
+        },
+
+        refresh() {
+            if (this.running) return;
+            this.running = true;
+            this.holdings = [];
+            this.status = '开始读取模拟盘持仓';
+            const es = new EventSource('/api/holdings-news/stream?days=' + encodeURIComponent(this.days));
+
+            es.addEventListener('progress', (e) => {
+                const d = JSON.parse(e.data);
+                if (d.message) this.status = d.message;
+            });
+
+            es.addEventListener('stock', (e) => {
+                const d = JSON.parse(e.data);
+                const row = d.holding;
+                if (!row) return;
+                const next = this.holdings.filter(item => item.code !== row.code);
+                next.push(row);
+                this.holdings = next;
+                this.status = '已完成 ' + d.index + ' / ' + d.total + '：' + (row.name || row.code);
+            });
+
+            es.addEventListener('done', (e) => {
+                const d = JSON.parse(e.data);
+                this.applyPayload(d);
+                const n = (d.holdings || []).length;
+                this.status = '完成，共 ' + n + ' 只持仓';
+                this.running = false;
+                es.close();
+            });
+
+            es.addEventListener('error_event', (e) => {
+                const d = JSON.parse(e.data);
+                this.status = d.error || '抓取失败';
+                this.running = false;
+                es.close();
+            });
+
+            es.onerror = () => {
+                if (this.running) {
+                    this.status = '连接断开';
+                    this.running = false;
+                }
+                es.close();
+            };
+        },
+    };
+}
+</script>
+{% endblock %}

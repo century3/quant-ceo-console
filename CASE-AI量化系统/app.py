@@ -51,7 +51,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import RedirectResponse, HTMLResponse
 
-from routes import morning, live, system as sys_route, backtest, dragon
+from routes import morning, live, system as sys_route, backtest, dragon, holdings_news
 from routes.live import _SIM as _LIVE_SIM
 from lib.live_simulator import merge_watch_codes
 
@@ -92,6 +92,7 @@ templates = Jinja2Templates(directory=str(THIS_DIR / "templates"))
 
 # REST 路由
 api.include_router(morning.router,   prefix="/api/morning",  tags=["morning"])
+api.include_router(holdings_news.router, prefix="/api/holdings-news", tags=["holdings-news"])
 api.include_router(live.router,      prefix="/api/live",     tags=["live"])
 api.include_router(sys_route.router, prefix="/api/system",   tags=["system"])
 api.include_router(backtest.router,  prefix="/api/backtest", tags=["backtest"])
@@ -115,6 +116,12 @@ def page_chat(request: Request):
 def page_morning(request: Request):
     return templates.TemplateResponse("morning.html",
                                       {"request": request, "active": "morning"})
+
+
+@api.get("/holdings-news", response_class=HTMLResponse)
+def page_holdings_news(request: Request):
+    return templates.TemplateResponse("holdings_news.html",
+                                      {"request": request, "active": "holdings-news"})
 
 
 @api.get("/live", response_class=HTMLResponse)

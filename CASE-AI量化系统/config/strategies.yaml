@@ -9,7 +9,7 @@ per_stock:
   601788.SH: macd_1d
   000612.SZ: macd_1d
   513100.SH: macd_1d
-  COHR.US: boll_revert
+  COHR.US: multi_factor_top
   GOOG.US: macd_1d
   IPSC.US: macd_1d
   NVDA.US: macd_1d

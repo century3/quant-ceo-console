@@ -81,7 +81,7 @@ def _resolve_code_or_error(raw: str) -> Dict[str, Any]:
 
     text = (raw or "").strip()
     if not text:
-        return {"ok": False, "message": "请填写股票代码或名称 (例: 600519.SH / 贵州茅台)"}
+        return {"ok": False, "message": "请填写股票代码或名称 (例: 600519.SH / 贵州茅台 / COHR)"}
     code, name = resolve_stock_query(text)
     if code:
         return {"ok": True, "code": code, "name": name}
