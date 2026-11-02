@@ -1,0 +1,21 @@
+{
+  "overall_sentiment": "谨慎",
+  "fear_greed_index": 45,
+  "positive_count": 2,
+  "negative_count": 3,
+  "neutral_count": 5,
+  "top_themes": [
+    "电子行业资金流出",
+    "科创板资金动向",
+    "国家大基金持股概念"
+  ],
+  "risk_alerts": [
+    "电子行业多公司资金流出，可能持续影响股价",
+    "市场情绪偏谨慎，需关注资金流向变化"
+  ],
+  "opportunity_hints": [
+    "关注科创板主力资金净流入的个股",
+    "留意国家大基金持股概念的潜在机会"
+  ],
+  "summary": "整体市场情绪偏谨慎，电子行业资金流出引发担忧，但科创板和大基金相关概念表现积极。"
+}

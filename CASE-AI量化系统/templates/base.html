@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}AI 量化交易系统{% endblock %}</title>
+
+    <!-- 本地静态资源, 不走外网 CDN -->
+    <link rel="stylesheet" href="/static/vendor/tailwind.min.css">
+    <!-- 必须先于 Alpine: defer 脚本按顺序执行, main.js 定义 window.App, 页面里 x-init 会调 App.get -->
+    <link rel="stylesheet" href="/static/css/main.css?v=20260920-chatkeep">
+    <script defer src="/static/js/main.js?v=20260920-chatkeep"></script>
+    <script defer src="/static/vendor/alpine.min.js"></script>
+    <!-- Plotly.js (图表) -->
+    {% block plotly %}{% endblock %}
+    <style>[x-cloak] { display: none !important; }</style>
+    {% block head_extra %}{% endblock %}
+</head>
+<body>
+<nav class="app-nav">
+    <div class="brand">
+        AI 量化系统 <span class="accent">|</span> CEO 控制台
+    </div>
+    <div class="nav-tabs">
+        <a href="/live/sim" class="nav-tab {% if active=='live' %}active{% endif %}">实盘监控</a>
+        <a href="/backtest" class="nav-tab {% if active=='backtest' %}active{% endif %}">回测</a>
+        <a href="/chat"     class="nav-tab {% if active=='chat' %}active{% endif %}">投研对话</a>
+        <a href="/morning"  class="nav-tab {% if active=='morning' %}active{% endif %}">晨会分析</a>
+        <a href="/system"   class="nav-tab {% if active=='system' %}active{% endif %}">系统状态</a>
+    </div>
+</nav>
+
+<main class="app-main" id="app-main"{% if active=='chat' %} hidden{% endif %}>
+    {% block content %}{% endblock %}
+</main>
+
+<!-- 投研对话 iframe 挂在外壳上, 切 Tab 只是显示/隐藏, 不销毁会话 -->
+<div id="chat-dock" class="page-keep-dock"{% if active!='chat' %} hidden{% endif %}>
+    <iframe id="chat-keep"{% if active=='chat' %} src="/gradio-chat/"{% endif %}></iframe>
+</div>
+<iframe id="page-keep" class="page-keep-frame" hidden></iframe>
+
+</body>
+</html>

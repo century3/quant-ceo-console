@@ -1,0 +1,30 @@
+# 界面层
+fastapi>=0.110.0       # 主框架 (REST + SSE)
+uvicorn[standard]>=0.27.0
+jinja2>=3.1.0          # 模板
+sse-starlette>=2.0.0   # 服务端推送 (晨会进度)
+gradio>=4.0.0          # 投研对话仍用 Gradio, 挂到 /chat
+plotly>=5.0.0          # 后端备用; 前端用 Plotly.js CDN
+
+# 编排层
+langgraph>=0.2.50
+langchain>=0.3.0
+langchain-community>=0.3.0
+deepagents>=0.0.10
+
+# 行情
+xtquant
+pandas>=2.0.0
+numpy>=1.24.0
+backtrader>=1.9.76.123
+
+# Agent / LLM
+dashscope>=1.20.0   # Charles / deepagents 用
+nanobot-ai==0.2.2   # 投研对话 Charles；包名 nanobot-ai，import nanobot；不要装最新版
+
+# 工具
+python-dotenv>=1.0.0
+pymysql>=1.1.0          # 晨会 morning_brief 读 wucai_trade
+pyyaml>=6.0
+chinese-calendar>=1.10.0
+apscheduler>=3.10.0

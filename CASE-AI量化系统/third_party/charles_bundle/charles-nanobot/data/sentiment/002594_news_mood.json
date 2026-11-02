@@ -1,0 +1,21 @@
+{
+  "overall_sentiment": "乐观",
+  "fear_greed_index": 75,
+  "positive_count": 5,
+  "negative_count": 0,
+  "neutral_count": 3,
+  "top_themes": [
+    "比亚迪财务表现",
+    "大宗交易",
+    "机构买入评级"
+  ],
+  "risk_alerts": [
+    "比亚迪净利润下降可能影响长期信心",
+    "市场中性信息可能削弱整体情绪"
+  ],
+  "opportunity_hints": [
+    "关注比亚迪相关股票的理财收益机会",
+    "关注机构买入评级的行业和个股"
+  ],
+  "summary": "市场情绪整体偏乐观，比亚迪多项利好推动积极情绪。"
+}

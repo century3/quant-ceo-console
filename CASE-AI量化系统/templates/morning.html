@@ -1,0 +1,314 @@
+{% extends "base.html" %}
+{% block title %}晨会分析 -- AI 量化系统{% endblock %}
+
+{% block content %}
+<div x-data="morningApp()" x-init="init()">
+
+    <button class="help-btn-floating" @click="showHelp = true" title="使用说明">?</button>
+
+    <!-- 使用说明 modal -->
+    <div class="modal-overlay" x-show="showHelp" x-cloak @click.self="showHelp = false">
+        <div class="modal-card">
+            <div class="modal-header">
+                <div class="modal-title">晨会分析 -- 使用说明</div>
+                <button class="modal-close" @click="showHelp = false">×</button>
+            </div>
+            <div class="modal-body">
+                <h4>数据从哪来</h4>
+                <p>本页只做<strong>读 MySQL（wucai_trade）</strong>上的分析与打分，不在此拉行情。
+                A 股用 <code>trade_sector_daily</code>、<code>trade_stock_daily</code>、<code>trade_stock_status</code>。
+                美股用 <code>trade_stock_us_daily</code>，板块来自采集脚本里的行业分组，等权合成指数后再打分。</p>
+
+                <h4>库数据更新（单独跑，较慢）</h4>
+                <p>在根目录 <code>.env</code> 中配置 <code>CASE_A_BOARD_DATA_PREP_DIR</code>，指向含
+                <code>run_daily.py</code> 的数据准备目录（与 <code>scheduler.py</code> 相同）。
+                进入该目录执行 <code>python run_daily.py</code> 做 K 线与板块指数增量同步；
+                首次全量请按数据准备目录自带的说明执行。</p>
+
+                <h4>分析流水线（4 节点）</h4>
+                <ol>
+                    <li><code>industry</code> -- 读库算板块强度、拐点相位（A 股申万二级，美股按采集分组）</li>
+                    <li><code>stock_picker</code> -- Top 板块成分股多因子（A 股日 K 或美股日 K）</li>
+                    <li><code>report</code> -- 生成简报 HTML/MD</li>
+                    <li><code>push</code> -- 钉钉/企微（未配置则控制台）</li>
+                </ol>
+
+                <h4>操作</h4>
+                <ul>
+                    <li><b>一键触发晨会</b>：只做上述分析（耗时主要取决于库内数据量与 Top 板块数量）</li>
+                    <li><b>用最近缓存</b>：读上次结果，不重新跑分析</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+
+    <div class="grid-2">
+        <!-- 左侧 (主结果) -->
+        <div class="flex-col">
+
+            <!-- 状态卡 -->
+            <div class="card" x-show="status">
+                <div class="card-header">
+                    <div class="card-title">运行状态</div>
+                    <div class="card-subtitle" x-text="elapsed + ' 秒'"></div>
+                </div>
+                <div x-html="status"></div>
+            </div>
+
+            <!-- Top 板块 -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-title" x-text="params.market === 'us' ? 'Top 强势板块（美股分组）' : 'Top 强势板块（申万二级）'"></div>
+                    <div class="card-subtitle">读库：动量 + 相对强度 + 量比 + 拐点相位</div>
+                </div>
+                <template x-if="industries.length === 0">
+                    <div class="text-gray-400 text-sm py-6 text-center">
+                        点右侧 "一键触发晨会" 或 "用最近缓存"
+                    </div>
+                </template>
+                <template x-if="industries.length > 0">
+                    <table class="app-table">
+                        <thead><tr>
+                            <th>#</th><th>板块</th>
+                            <th class="text-right">综合分</th>
+                            <th class="text-right">21日动量</th>
+                            <th class="text-right">60日强度</th>
+                            <th class="text-right">量比</th>
+                        </tr></thead>
+                        <tbody>
+                            <template x-for="r in industries" :key="r.industry">
+                                <tr>
+                                    <td x-text="r.rank"></td>
+                                    <td><b x-text="r.industry"></b></td>
+                                    <td class="text-right num"
+                                        :class="App.pnlClass(r.score)"
+                                        x-text="App.fmtSign(r.score, 3)"></td>
+                                    <td class="text-right num"
+                                        :class="App.pnlClass(r.MOM_21)"
+                                        x-text="App.fmtSign(r.MOM_21, 2, '%')"></td>
+                                    <td class="text-right num"
+                                        :class="App.pnlClass(r.RS_60)"
+                                        x-text="App.fmtSign(r.RS_60, 2, '%')"></td>
+                                    <td class="text-right num" x-text="App.fmtNum(r.VOL_R, 2)"></td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </template>
+            </div>
+
+            <!-- Top 选股 -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-title">Top 选中标的</div>
+                    <div class="card-subtitle">10 因子等权打分</div>
+                </div>
+                <template x-if="picked.length === 0">
+                    <div class="text-gray-400 text-sm py-6 text-center">(暂无)</div>
+                </template>
+                <template x-if="picked.length > 0">
+                    <table class="app-table">
+                        <thead><tr>
+                            <th>代码</th><th>行业</th>
+                            <th class="text-right">综合 alpha</th>
+                            <th class="text-right">3M 动量</th>
+                        </tr></thead>
+                        <tbody>
+                            <template x-for="p in picked" :key="p.code">
+                                <tr>
+                                    <td><code x-text="p.code"></code></td>
+                                    <td x-text="p.industry"></td>
+                                    <td class="text-right num"
+                                        :class="App.pnlClass(p.alpha)"
+                                        x-text="App.fmtSign(p.alpha, 3)"></td>
+                                    <td class="text-right num"
+                                        :class="App.pnlClass(p.raw_factors && p.raw_factors.MOM_3M)"
+                                        x-text="App.fmtPct(p.raw_factors && p.raw_factors.MOM_3M, 2)"></td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </template>
+            </div>
+
+            <!-- 节点对话历史 (折叠) -->
+            <div class="card" x-show="messages.length > 0">
+                <details>
+                    <summary>LangGraph 节点对话历史 (共 <span x-text="messages.length"></span> 条)</summary>
+                    <div style="margin-top: 8px;">
+                        <template x-for="m in messages">
+                            <div class="text-xs text-gray-600 py-1 font-mono">
+                                [<span x-text="m.time"></span>]
+                                <b x-text="m.role"></b> |
+                                <span x-text="m.content"></span>
+                            </div>
+                        </template>
+                    </div>
+                </details>
+            </div>
+
+        </div>
+
+        <!-- 右侧 (参数 + 触发 + 说明) -->
+        <div class="flex-col">
+
+            <!-- 触发参数 -->
+            <div class="card">
+                <div class="card-title mb-3">触发参数</div>
+
+                <div class="form-row">
+                    <label class="form-label">市场</label>
+                    <select class="form-input" x-model="params.market" @change="loadCache(true)">
+                        <option value="cn">A股（申万）</option>
+                        <option value="us">美股</option>
+                    </select>
+                </div>
+                <div class="form-row">
+                    <label class="form-label">Top N 板块</label>
+                    <input type="range" class="form-range" min="1" max="10" step="1"
+                           x-model.number="params.top_industries"/>
+                    <span class="num text-gray-700" style="width:30px;"
+                          x-text="params.top_industries"></span>
+                </div>
+                <div class="form-row">
+                    <label class="form-label">Top N 选股</label>
+                    <input type="range" class="form-range" min="1" max="20" step="1"
+                           x-model.number="params.top_stocks"/>
+                    <span class="num text-gray-700" style="width:30px;"
+                          x-text="params.top_stocks"></span>
+                </div>
+                <div class="form-row">
+                    <label class="form-label">候选股/板块</label>
+                    <input type="range" class="form-range" min="5" max="50" step="5"
+                           x-model.number="params.sample_per_industry"/>
+                    <span class="num text-gray-700" style="width:30px;"
+                          x-text="params.sample_per_industry"></span>
+                </div>
+                <div class="form-row">
+                    <label class="form-label">K 线天数</label>
+                    <input type="range" class="form-range" min="60" max="250" step="10"
+                           x-model.number="params.lookback"/>
+                    <span class="num text-gray-700" style="width:30px;"
+                          x-text="params.lookback"></span>
+                </div>
+
+                <div class="flex gap-2 mt-4">
+                    <button class="btn btn-primary flex-1"
+                            :disabled="running"
+                            @click="trigger()">
+                        <span x-show="!running">一键触发晨会</span>
+                        <span x-show="running">运行中...</span>
+                    </button>
+                    <button class="btn btn-secondary"
+                            :disabled="running"
+                            @click="loadCache()">用最近缓存</button>
+                </div>
+            </div>
+
+        </div>
+    </div>
+</div>
+
+<script>
+function morningApp() {
+    return {
+        showHelp: false,
+        running: false,
+        elapsed: 0,
+        status: '',
+        industries: [],
+        picked: [],
+        messages: [],
+        params: {
+            market: 'cn',
+            top_industries: 3,
+            top_stocks: 5,
+            sample_per_industry: 15,
+            lookback: 90,
+        },
+        timerId: null,
+
+        init() {
+            // 启动时尝试自动加载最近缓存
+            this.loadCache(true);
+        },
+
+        async loadCache(silent = false) {
+            const r = await App.get('/api/morning/cache?market=' + encodeURIComponent(this.params.market));
+            if (r.error) {
+                if (!silent) App.toast(r.error, 'warn');
+                return;
+            }
+            this.industries = r.industry_rank || [];
+            this.picked = r.picked_stocks || [];
+            this.messages = r.messages || [];
+            this.status = r.saved_at
+                ? `<div class="text-xs text-gray-500">缓存数据 (保存于 ${r.saved_at})</div>`
+                : '';
+            this.elapsed = 0;
+        },
+
+        async trigger() {
+            this.running = true;
+            this.industries = [];
+            this.picked = [];
+            this.messages = [];
+            this.status = `<span class="qa-loader">准备启动 ${4} 节点工作流<span class="qa-loader-dots"><i></i><i></i><i></i></span></span>`;
+            this.elapsed = 0;
+
+            const t0 = Date.now();
+            this.timerId = setInterval(() => {
+                this.elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+            }, 250);
+
+            // SSE 流式
+            const url = '/api/morning/stream?'
+                + new URLSearchParams(this.params).toString();
+            const es = new EventSource(url);
+
+            es.addEventListener('progress', (e) => {
+                const d = JSON.parse(e.data);
+                this.status = `<div class="text-sm text-gray-600">当前节点: <b>${d.current_node}</b> (${d.estimate || ''})</div>`
+                    + `<div class="mt-2"><span class="qa-loader">${d.message}<span class="qa-loader-dots"><i></i><i></i><i></i></span></span></div>`;
+            });
+
+            es.addEventListener('node_done', (e) => {
+                const d = JSON.parse(e.data);
+                this.industries = d.industry_rank || [];
+                this.picked = d.picked_stocks || [];
+                this.messages = d.messages || [];
+                this.status = `<div class="text-sm text-green-700">完成: <b>${d.node_label}</b></div>`;
+            });
+
+            es.addEventListener('done', (e) => {
+                const d = JSON.parse(e.data);
+                this.industries = d.industry_rank || [];
+                this.picked = d.picked_stocks || [];
+                this.messages = d.messages || [];
+                this.status = `<div class="text-sm text-green-700"><b>全部完成</b> -- Top ${this.industries.length} 板块, 选出 ${this.picked.length} 只标的</div>`;
+                this.running = false;
+                if (this.timerId) clearInterval(this.timerId);
+                es.close();
+            });
+
+            es.addEventListener('error_event', (e) => {
+                const d = JSON.parse(e.data);
+                this.status = `<div class="text-sm text-red-700">[ERROR] ${d.error}</div>`;
+                this.running = false;
+                if (this.timerId) clearInterval(this.timerId);
+                es.close();
+            });
+
+            es.onerror = (e) => {
+                if (this.running) {
+                    this.status = `<div class="text-sm text-red-700">[连接断开]</div>`;
+                    this.running = false;
+                    if (this.timerId) clearInterval(this.timerId);
+                }
+                es.close();
+            };
+        },
+    }
+}
+</script>
+{% endblock %}

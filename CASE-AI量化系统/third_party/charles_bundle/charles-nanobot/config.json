@@ -1,0 +1,34 @@
+{
+  "agents": {
+    "defaults": {
+      "workspace": ".",
+      "model": "qwen3.8-max",
+      "provider": "auto",
+      "max_tokens": 8192,
+      "context_window_tokens": 65536,
+      "temperature": 0.1,
+      "max_tool_iterations": 50,
+      "max_tool_result_chars": 16000,
+      "timezone": "Asia/Shanghai"
+    }
+  },
+  "providers": {
+    "dashscope": {
+      "api_key": ""
+    }
+  },
+  "tools": {
+    "web": {
+      "enable": true,
+      "search": {
+        "provider": "tavily",
+        "api_key": ""
+      }
+    },
+    "exec": {
+      "enable": true,
+      "timeout": 120
+    },
+    "restrict_to_workspace": false
+  }
+}

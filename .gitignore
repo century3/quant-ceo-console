@@ -1,0 +1,31 @@
+# 本机密钥与账户配置
+.env
+**/.env
+!**/.env.example
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 运行产物
+CASE-AI量化系统/outputs/
+CASE-龙头战法/outputs/
+CASE-AI量化系统/data/cache/
+CASE-AI量化系统/morning_brief/outputs/
+
+# 模拟盘股数和成本留在本机
+CASE-AI量化系统/config/mock_positions.yaml
+
+# 投研会话、本机行情缓存
+CASE-AI量化系统/third_party/charles_bundle/charles_runtime/
+CASE-AI量化系统/third_party/charles_bundle/charles-nanobot/memory/
+CASE-AI量化系统/third_party/charles_bundle/charles-nanobot/.nanobot/
+CASE-AI量化系统/third_party/charles_bundle/charles-nanobot/cohr_daily.csv
+CASE-AI量化系统/third_party/charles_bundle/charles-nanobot/cohr_ta.csv
+CASE-AI量化系统/third_party/charles_bundle/charles-nanobot/cohr_raw.json
+
+# 第三方研报、财报原文和课件 PDF
+*.pdf
+CASE-AI量化系统/third_party/charles_bundle/charles-nanobot/data/reports/
+CASE-AI量化系统/third_party/charles_bundle/charles-nanobot/data/financial_reports/

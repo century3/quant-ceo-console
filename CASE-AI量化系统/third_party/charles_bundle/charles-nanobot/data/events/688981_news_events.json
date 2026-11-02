@@ -1,0 +1,150 @@
+{
+  "summary": {
+    "total_news": 8,
+    "events_detected": 8,
+    "bullish_events": 6,
+    "bearish_events": 2,
+    "policy_events": 0
+  },
+  "events": [
+    {
+      "news_index": 0,
+      "news_preview": "南方财经3月26日电，中芯国际688981.SH)发布2025年年度报告，实现营业收入673.23亿元，同比增长16.49%；归属于上市公司股东的净利润为50.41亿元，同比增长36.29%。 中芯国际：2025年净利润同比增长36%",
+      "detection_method": "llm",
+      "has_event": true,
+      "event_type": "利好",
+      "event_category": "业绩预增",
+      "event_description": "中芯国际发布2025年年度报告，实现营业收入和净利润双增长。",
+      "related_stocks": [
+        "688981.SH"
+      ],
+      "urgency": "高",
+      "confidence": 5,
+      "signal": "看多",
+      "signal_reason": "业绩超预期增长"
+    },
+    {
+      "news_index": 1,
+      "news_preview": "人民财讯3月26日电，中芯国际6889813月26日披露年报，2025年实现营业收入673.23亿元，同比增长16.5%；归母净利润50.41亿元，同比增长36.3%；基本每股收益0.63元。 中芯国际：2025年净利润50.41亿元 同比增长36.3%",
+      "detection_method": "llm",
+      "has_event": true,
+      "event_type": "利好",
+      "event_category": "业绩预增",
+      "event_description": "中芯国际2025年净利润同比增长36.3%，达到50.41亿元。",
+      "related_stocks": [
+        "688981"
+      ],
+      "urgency": "高",
+      "confidence": 5,
+      "signal": "看多",
+      "signal_reason": "业绩超预期增长"
+    },
+    {
+      "news_index": 2,
+      "news_preview": "电子行业资金流出榜 代码 简称 今日涨跌幅（%） 今日换手率（%） 主力资金流量（万元） 002475 立讯精密 -3.66 2.20 -149021.29 300476 胜宏科技 -1.84 2.59 -52297.56 688041 海光信息 -2.36 0.63 -50707.00 68898",
+      "detection_method": "llm",
+      "has_event": true,
+      "event_type": "利空",
+      "event_category": "资金流出",
+      "event_description": "电子行业多只股票出现主力资金净流出，表明市场短期情绪偏谨慎。",
+      "related_stocks": [
+        "002475",
+        "300476",
+        "688041"
+      ],
+      "urgency": "中",
+      "confidence": 4,
+      "signal": "回避",
+      "signal_reason": "利空事件 - 资金流出"
+    },
+    {
+      "news_index": 3,
+      "news_preview": "中信证券 1.9600 3007610.10 38.58 7485436.84 28.79 300054 鼎龙股份 0.7700 72020.45 38.32 365990.70 9.66 603999 读者传媒 0.1500 8549.41 37.32 90357.08 -6.51 688981 ",
+      "detection_method": "llm",
+      "has_event": true,
+      "event_type": "利好",
+      "event_category": "业绩预增",
+      "event_description": "9家公司的年报业绩增幅翻倍。",
+      "related_stocks": [
+        "300761",
+        "300054",
+        "603999",
+        "688981"
+      ],
+      "urgency": "高",
+      "confidence": 5,
+      "signal": "看多",
+      "signal_reason": "业绩超预期增长"
+    },
+    {
+      "news_index": 4,
+      "news_preview": "3月26日，中芯国际688981公布2025年年报，公司营业收入为673.23亿元，同比上升16.5%；归母净利润为50.41亿元，同比上升36.3%；扣非归母净利润为41.24亿元，同比上升55.9%；经营现金流净额为200.81亿元，同比下降11.4%；EPS(全面摊薄)为 中芯国际：2025年",
+      "detection_method": "llm",
+      "has_event": true,
+      "event_type": "利好",
+      "event_category": "业绩预增",
+      "event_description": "中芯国际2025年归母净利润同比增长36.3%，显示公司盈利能力增强。",
+      "related_stocks": [
+        "688981"
+      ],
+      "urgency": "高",
+      "confidence": 5,
+      "signal": "看多",
+      "signal_reason": "业绩超预期增长"
+    },
+    {
+      "news_index": 5,
+      "news_preview": "3月26日，国内两大晶圆代工厂中芯国际（688981.SH）和华虹半导体（688347.SH）先后发布2025年年报。 国内两大晶圆代工巨头2025年业绩出炉",
+      "detection_method": "llm",
+      "has_event": true,
+      "event_type": "利好",
+      "event_category": "业绩公布",
+      "event_description": "国内两大晶圆代工厂中芯国际和华虹半导体发布2025年年报。",
+      "related_stocks": [
+        "688981.SH",
+        "688347.SH"
+      ],
+      "urgency": "高",
+      "confidence": 5,
+      "signal": "关注",
+      "signal_reason": "利好事件 - 业绩公布"
+    },
+    {
+      "news_index": 6,
+      "news_preview": "电力设备 300476 胜宏科技 257.28 -1.84 -5.07 电子 300059 东方财富 19.07 -0.73 -4.07 非银金融 601600 中国铝业 11.97 4.63 -3.98 有色金属 000617 中油资本 10.21 -4.04 -3.74 非银金融 688981 ",
+      "detection_method": "llm",
+      "has_event": true,
+      "event_type": "利空",
+      "event_category": "股价下跌",
+      "event_description": "多只股票出现明显下跌，显示市场情绪偏空。",
+      "related_stocks": [
+        "300476",
+        "300059",
+        "601600",
+        "000617",
+        "688981"
+      ],
+      "urgency": "高",
+      "confidence": 4,
+      "signal": "回避",
+      "signal_reason": "利空事件 - 股价下跌"
+    },
+    {
+      "news_index": 7,
+      "news_preview": "蓝鲸新闻3月26日讯（记者徐甘甘）3月26日，中芯国际（688981.SH，0981.HK）发布2025年业绩报告。 2025年度，公司实现营业收入93.27亿美元，较上年同期增长16.2%；毛利为19.57亿美元，毛利率为21%。 中芯国际25年营收93.27亿美元，净利润6.85亿美元，同比增长",
+      "detection_method": "llm",
+      "has_event": true,
+      "event_type": "利好",
+      "event_category": "业绩预增",
+      "event_description": "中芯国际2025年实现营业收入93.27亿美元，净利润6.85亿美元，同比增长39%",
+      "related_stocks": [
+        "688981.SH",
+        "0981.HK"
+      ],
+      "urgency": "高",
+      "confidence": 5,
+      "signal": "看多",
+      "signal_reason": "业绩超预期增长"
+    }
+  ]
+}

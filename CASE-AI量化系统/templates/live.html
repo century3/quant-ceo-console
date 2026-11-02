@@ -1,0 +1,3050 @@
+{% extends "base.html" %}
+{% block title %}实盘监控 -- AI 量化系统{% endblock %}
+
+{% block plotly %}
+<script src="/static/vendor/plotly.min.js"></script>
+{% endblock %}
+
+{% block content %}
+<div x-data="liveApp()" x-init="init()">
+
+    <!-- 使用说明 modal -->
+    <div class="modal-overlay" x-show="showHelp" x-cloak @click.self="showHelp = false">
+        <div class="modal-card">
+            <div class="modal-header">
+                <div class="modal-title">实盘监控 -- 使用说明</div>
+                <button class="modal-close" @click="showHelp = false">×</button>
+            </div>
+            <div class="modal-body text-sm">
+                <p class="text-gray-700 leading-relaxed mb-3">
+                    本页负责<strong>自动跑策略循环</strong> (约每分钟一轮): 拉行情 → 算信号 → 风控 → 下单。
+                    默认<strong>模拟</strong>, 不会连券商。当前工具是 <b>{{ qmt_backend }}</b>。
+                    {% if not can_trade %}通达信只能灌历史数据，模拟盘用日线收盘价，没有实盘下单。{% else %}选实盘前务必确认账户已登录。{% endif %}
+                </p>
+
+                <h4 class="text-gray-900 font-medium mt-2 mb-1">怎么用 (三步)</h4>
+                <ol class="list-decimal pl-5 space-y-1.5 text-gray-700">
+                    <li>左侧「实时持仓」点右上 <strong>+ 添加股票</strong>, 输入代码并选策略 (如 MACD 日K), 确定后写盘并热加载。旁边「仓位管理」给股票分档、看目标金额。</li>
+                    <li>需要切换某只股票的策略时, 直接点「实时持仓」表里的<strong>策略名</strong>即可弹窗切换。</li>
+                    <li>点持仓里的<strong>代码 / 名称</strong>可弹出日 K 线图 (含均线与成交量)。</li>
+                    <li>右侧「资金面板」头部即是引擎开关 -- <strong>启动 / 停止</strong>; 持仓 / 信号 / 订单约 <strong>5 秒</strong>自动刷新。</li>
+                </ol>
+
+                <h4 class="text-gray-900 font-medium mt-4 mb-1">监控列表从哪来</h4>
+                <p class="text-gray-600 text-xs leading-relaxed">
+                    合并去重: mock 持仓 + watch_pool 列表 + 已绑定策略 (per_stock) 的代码; 「添加股票」会同时写 watch_pool 和 per_stock。
+                    A 股 <strong>T+1</strong>: 当日买的次日才能卖, 策略按日 K 波段下单。
+                </p>
+
+                <h4 class="text-gray-900 font-medium mt-4 mb-1">引擎控制 / 风控 / 应急</h4>
+                <p class="text-gray-600 text-xs leading-relaxed">
+                    右侧「资金面板」头部带<strong>启动 / 停止</strong>按钮和状态徽章 (RUNNING / PAUSED / HALTED);
+                    下方「重置模拟盘」会先弹出当前股票、策略、档位和起始日，确认后再按这套回放。
+                    更下方「风控」卡片说明档位开仓 (已分档才买) 与亏 ≥2% 自动熔断;
+                    最底部「应急干预」(暂停买入 / 一键清仓 / 强制熔断) 平时折叠, 黑天鹅时才打开。
+                </p>
+
+                <h4 class="text-gray-900 font-medium mt-4 mb-1">进阶扩展</h4>
+                <ul class="list-disc pl-5 text-gray-600 text-xs space-y-1">
+                    <li><strong>兜底策略</strong>: 未在 per_stock 里指定的代码会走 <code>config/strategies.yaml</code> 的 <code>default</code>。</li>
+                    <li><strong>批量编辑 / 临时代码</strong>: 直接改 <code>config/watch_pool.yaml</code>、<code>config/strategies.yaml</code>; 修改后调 <code>POST /api/live/strategies/config</code> 触发热加载。</li>
+                    <li><strong>事件流</strong>: 每轮循环的耗时与信号数, 可在 <code>GET /api/live/state</code> 的 <code>events</code> 字段查看。</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+
+    <!-- 添加股票并绑定策略 -->
+    <div class="modal-overlay modal-overlay-top" x-show="stockBind.show" x-cloak @click.self="stockBind.show = false">
+        <div class="modal-card" style="max-width:400px;">
+            <div class="modal-header">
+                <div class="modal-title">添加股票并绑定策略</div>
+                <button type="button" class="modal-close" @click="stockBind.show = false">×</button>
+            </div>
+            <div class="modal-body text-sm">
+                <p class="text-xs text-gray-600 mb-2 leading-relaxed">写入监控列表与 <code>strategies.yaml</code> 并热加载；出<strong>买/卖信号</strong>时由主循环按该策略计算。</p>
+                <p class="text-xs text-gray-400 mb-3 leading-relaxed border-l-2 border-gray-200 pl-2">
+                    <strong>买入数量</strong>不由本弹窗填写：先在仓位管理里分档，有买点时按该档目标金额整手买入。未分档只监控、不开仓。
+                </p>
+                <div class="mb-3" style="position:relative;">
+                    <div class="text-xs text-gray-600 mb-1">股票代码 / 名称</div>
+                    <input type="text" class="form-input w-full text-sm"
+                           x-model="stockBind.code"
+                           @input="onStockBindQueryInput()"
+                           @keydown.enter.prevent="confirmStockBind()"
+                           placeholder="例: 兆易创新 / 603986.SH"
+                           autocomplete="off">
+                    <div x-show="stockBind.suggests.length > 0" x-cloak
+                         class="stock-suggest-list">
+                        <template x-for="item in stockBind.suggests" :key="'sg-' + item.code">
+                            <button type="button" class="stock-suggest-item"
+                                    @click="pickStockSuggest(item)">
+                                <span class="stock-suggest-name" x-text="item.name"></span>
+                                <span class="stock-suggest-code" x-text="item.code"></span>
+                            </button>
+                        </template>
+                    </div>
+                </div>
+                <div class="mb-4">
+                    <div class="text-xs text-gray-600 mb-1">策略</div>
+                    <template x-if="strategyFlat.length > 0">
+                        <select class="form-input w-full" style="font-size:13px;" x-model="stockBind.strategy">
+                            <option value="">请选择策略</option>
+                            <template x-for="s in strategyFlat" :key="'bindopt-' + s.name">
+                                <option :value="s.name" x-text="'[' + s.group + '] ' + s.label"></option>
+                            </template>
+                        </select>
+                    </template>
+                    <template x-if="strategyFlat.length === 0">
+                        <div class="text-gray-400 text-xs">策略列表加载中...</div>
+                    </template>
+                </div>
+                <div class="flex gap-2 justify-end">
+                    <button type="button" class="btn btn-secondary btn-sm" @click="stockBind.show = false">取消</button>
+                    <button type="button" class="btn btn-primary btn-sm" @click="confirmStockBind()">确定</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 仓位管理: 记名分档, 卖掉档还在, 涨过目标不减仓 -->
+    <div class="modal-overlay" x-show="posAlloc.show" x-cloak @click.self="posAlloc.show = false">
+        <div class="modal-card" style="max-width:820px;">
+            <div class="modal-header">
+                <div class="modal-title">仓位管理</div>
+                <button type="button" class="modal-close" @click="posAlloc.show = false">×</button>
+            </div>
+            <div class="modal-body text-sm">
+                <div class="alloc-help">
+                    <p>总资金可改：改数字保存后，每档 = 新本金 ÷ 档数，<b>只影响之后买入</b>；已有持仓不自动加减。总资产仍是本金 + 盈亏。</p>
+                    <p>最多 <b x-text="posAlloc.draftSlots"></b> 档，每档
+                        <b class="num" x-text="App.fmtNum(draftSlotAmount(), 0)"></b>。
+                        档记在股票名下：<b>已分档才能买</b>，这笔钱锁给它，别的票用不了。</p>
+                    <p>开仓按目标金额买（整手，可能略少）。<b>卖掉档还在</b>，下次还用自己这笔，不会被别人截走。</p>
+                    <p>市值涨过目标是浮盈，<b>不自动减仓</b>，等策略卖。后面加进来的票默认只监控，要点「分档」才给预算；有持仓时不能释放。</p>
+                </div>
+                <div class="alloc-summary grid grid-cols-4 gap-2">
+                    <div class="alloc-summary-item">
+                        <div class="alloc-summary-label">总资金</div>
+                        <div class="alloc-summary-value num" x-text="App.fmtNum(posAlloc.draftCapital || 0, 0)"></div>
+                    </div>
+                    <div class="alloc-summary-item">
+                        <div class="alloc-summary-label">已分档</div>
+                        <div class="alloc-summary-value" x-text="slotCodes().length + ' / ' + maxSlots()"></div>
+                    </div>
+                    <div class="alloc-summary-item">
+                        <div class="alloc-summary-label">每档目标</div>
+                        <div class="alloc-summary-value num" x-text="App.fmtNum(draftSlotAmount(), 0)"></div>
+                    </div>
+                    <div class="alloc-summary-item">
+                        <div class="alloc-summary-label">未分档</div>
+                        <div class="alloc-summary-value" x-text="unassignedCount() + ' 只'"></div>
+                    </div>
+                </div>
+                <div class="flex items-center gap-3 mb-3">
+                    <label class="text-xs text-gray-600" for="alloc-capital-input">总资金</label>
+                    <input id="alloc-capital-input" type="number" class="form-input"
+                           style="width:128px;font-size:13px;"
+                           min="1" step="10000" x-model.number="posAlloc.draftCapital">
+                    <label class="text-xs text-gray-600" for="alloc-slots-input">最多几档</label>
+                    <input id="alloc-slots-input" type="number" class="form-input"
+                           style="width:72px;font-size:13px;"
+                           min="1" max="10" step="1" x-model.number="posAlloc.draftSlots">
+                    <span class="text-xs text-gray-500">档，每档
+                        <b class="num" x-text="App.fmtNum(draftSlotAmount(), 0)"></b>
+                    </span>
+                    <button type="button" class="btn btn-primary btn-sm ml-auto" @click="saveMaxSlots()">保存</button>
+                </div>
+                <table class="app-table">
+                    <thead>
+                        <tr>
+                            <th>股票</th>
+                            <th>档位</th>
+                            <th class="text-right">目标金额</th>
+                            <th class="text-right">当前市值</th>
+                            <th>说明</th>
+                            <th></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <template x-for="row in allocRows()" :key="'alloc-' + row.code">
+                            <tr>
+                                <td>
+                                    <span x-text="row.name || row.code"></span>
+                                    <code class="text-xs text-gray-400 ml-1" x-text="row.code"></code>
+                                </td>
+                                <td x-text="row.slotted ? '已分档' : '未分档'"></td>
+                                <td class="text-right num" x-text="row.slotted ? App.fmtNum(row.target, 0) : '—'"></td>
+                                <td class="text-right num" x-text="row.held ? App.fmtNum(row.mv, 0) : '0'"></td>
+                                <td class="text-xs text-gray-500" x-text="row.note"></td>
+                                <td class="text-right">
+                                    <button type="button" class="btn btn-primary btn-sm"
+                                            style="padding:2px 8px;font-size:11px;"
+                                            x-show="!row.slotted"
+                                            :disabled="slotCodes().length >= maxSlots()"
+                                            @click="assignSlot(row.code)"
+                                            x-text="slotCodes().length >= maxSlots() ? '档满' : '分档'"></button>
+                                    <button type="button" class="btn btn-secondary btn-sm"
+                                            style="padding:2px 8px;font-size:11px;"
+                                            x-show="row.slotted"
+                                            :disabled="row.held"
+                                            @click="releaseSlot(row.code)"
+                                            x-text="row.held ? '持仓中' : '释放'"></button>
+                                </td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- 重置模拟盘: 草稿, 点开始重置才写盘回放 -->
+    <div class="modal-overlay" x-show="resetBook.show" x-cloak @click.self="!resetBook.busy && (resetBook.show = false)">
+        <div class="modal-card reset-modal-card">
+            <div class="modal-header">
+                <div class="modal-title">重置模拟盘</div>
+                <button type="button" class="modal-close" :disabled="resetBook.busy"
+                        @click="resetBook.show = false">×</button>
+            </div>
+            <div class="modal-body text-sm">
+                <div class="alloc-help">
+                    <p>这里是草稿，改资金、档数、股票或策略不会动首页。点开始重置后，才按这套从起始日重新回放。</p>
+                    <p>股票框输入名称或代码即可搜索清单。添加 / 移除只改草稿，最多
+                        <b x-text="resetBook.draftSlots"></b> 档，每档
+                        <b class="num" x-text="App.fmtNum(resetDraftSlotAmount(), 0)"></b>。</p>
+                </div>
+                <div class="alloc-summary grid grid-cols-4 gap-2">
+                    <div class="alloc-summary-item">
+                        <div class="alloc-summary-label">总资金</div>
+                        <input type="number" class="form-input"
+                               style="width:100%;font-size:13px;margin-top:2px;"
+                               min="1" step="10000"
+                               :disabled="resetBook.busy"
+                               x-model.number="resetBook.draftCapital">
+                    </div>
+                    <div class="alloc-summary-item">
+                        <div class="alloc-summary-label">档数</div>
+                        <input type="number" class="form-input"
+                               style="width:100%;font-size:13px;margin-top:2px;"
+                               min="1" max="10" step="1"
+                               :disabled="resetBook.busy"
+                               x-model.number="resetBook.draftSlots">
+                    </div>
+                    <div class="alloc-summary-item">
+                        <div class="alloc-summary-label">每档</div>
+                        <div class="alloc-summary-value num"
+                             x-text="App.fmtNum(resetDraftSlotAmount(), 0)"></div>
+                    </div>
+                    <div class="alloc-summary-item">
+                        <div class="alloc-summary-label">起始日</div>
+                        <input type="date" class="form-input"
+                               style="width:100%;font-size:13px;margin-top:2px;"
+                               :disabled="resetBook.busy"
+                               x-model="resetBook.startDate">
+                    </div>
+                </div>
+                <div class="flex items-center justify-between mb-2">
+                    <div class="text-xs text-gray-500">回放名单</div>
+                    <button type="button" class="btn btn-primary btn-sm"
+                            style="padding:3px 12px;font-size:12px;"
+                            :disabled="resetBook.busy || resetBook.rows.length >= resetBook.draftSlots"
+                            @click="addResetRow()"
+                            x-text="resetBook.rows.length >= resetBook.draftSlots ? '档满' : '+ 添加股票'"></button>
+                </div>
+                <table class="app-table reset-table">
+                    <thead>
+                        <tr>
+                            <th class="reset-col-stock">股票</th>
+                            <th class="reset-col-strategy">执行策略</th>
+                            <th class="reset-col-handle">这次怎么处理</th>
+                            <th class="reset-col-op">操作</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <template x-if="resetBook.rows.length === 0">
+                            <tr>
+                                <td colspan="4" class="text-gray-400 text-center py-3">还没有档，点右上角添加，或先在仓位管理里分档</td>
+                            </tr>
+                        </template>
+                        <template x-for="row in resetBook.rows" :key="row.id">
+                            <tr>
+                                <td>
+                                    <div style="position:relative;">
+                                        <input type="text" class="form-input w-full"
+                                               style="font-size:13px;"
+                                               :disabled="resetBook.busy"
+                                               x-model="row.query"
+                                               autocomplete="off"
+                                               @focus="$event.target.select(); onResetStockInput(row)"
+                                               @input="onResetStockInput(row)"
+                                               placeholder="搜名称或代码，例如 茅台">
+                                        <div x-show="row.suggests.length > 0" x-cloak
+                                             class="stock-suggest-list">
+                                            <template x-for="item in row.suggests" :key="'rs-' + row.id + '-' + item.code">
+                                                <button type="button" class="stock-suggest-item"
+                                                        @click="pickResetStock(row, item)">
+                                                    <span class="stock-suggest-name" x-text="item.name"></span>
+                                                    <span class="stock-suggest-code" x-text="item.code"></span>
+                                                </button>
+                                            </template>
+                                        </div>
+                                    </div>
+                                </td>
+                                <td>
+                                    <select class="form-input w-full reset-strategy-select"
+                                            :disabled="resetBook.busy"
+                                            :value="row.strategy"
+                                            @change="row.strategy = $event.target.value">
+                                        <template x-for="g in strategyGroups" :key="'rstg-' + row.id + '-' + g.name">
+                                            <optgroup :label="g.name">
+                                                <template x-for="s in g.items" :key="'rst-' + row.id + '-' + s.name">
+                                                    <option :value="s.name"
+                                                            :selected="s.name === row.strategy"
+                                                            x-text="s.label"></option>
+                                                </template>
+                                            </optgroup>
+                                        </template>
+                                    </select>
+                                </td>
+                                <td class="text-gray-600 reset-col-handle"
+                                    x-text="'分档开仓 ' + App.fmtNum(resetDraftSlotAmount(), 0)"></td>
+                                <td class="text-right reset-col-op">
+                                    <button type="button" class="btn btn-secondary btn-sm"
+                                            style="padding:2px 8px;font-size:11px;"
+                                            :disabled="resetBook.busy"
+                                            @click="removeResetRow(row.id)">移除</button>
+                                </td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+            </div>
+            <div class="reset-modal-footer flex items-center justify-end gap-2">
+                <button type="button" class="btn btn-secondary btn-sm"
+                        :disabled="resetBook.busy"
+                        @click="resetBook.show = false">取消</button>
+                <button type="button" class="btn btn-primary btn-sm"
+                        :disabled="resetBook.busy || resetBook.rows.length === 0"
+                        @click="confirmResetPositions()"
+                        x-text="resetBook.busy ? '回放中…' : '开始重置'"></button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 信号全部: 首页只露最近几条, 点更多看合并后的全表 -->
+    <div class="modal-overlay" x-show="signalBook.show" x-cloak @click.self="signalBook.show = false">
+        <div class="modal-card" style="max-width:920px;">
+            <div class="modal-header">
+                <div class="modal-title">
+                    信号
+                    <span class="text-xs text-gray-500 font-normal ml-2"
+                          x-text="allSignals().length + ' 条'"></span>
+                </div>
+                <button type="button" class="modal-close" @click="signalBook.show = false">×</button>
+            </div>
+            <div class="modal-body text-sm" style="max-height:70vh; overflow-y:auto;">
+                <p class="text-xs text-gray-400 mb-3">
+                    同向连续已合并。原始库
+                    <span x-text="(state.signals || []).length + '/100'"></span>
+                    ，满了丢掉最旧的。
+                </p>
+                <template x-if="allSignals().length === 0">
+                    <div class="text-gray-400 text-xs py-3 text-center">暂无信号</div>
+                </template>
+                <template x-if="allSignals().length > 0">
+                    <table class="app-table">
+                        <thead><tr>
+                            <th>时间</th><th>股票</th><th>方向</th><th>策略</th><th>原因</th>
+                        </tr></thead>
+                        <tbody>
+                            <template x-for="(s, i) in allSignals()" :key="'all-sig-' + i + '-' + (s.ts || '')">
+                                <tr>
+                                    <td class="num text-xs">
+                                        <span x-text="App.fmtSignalTs(s.ts)"></span>
+                                        <span x-show="s._dupCount > 1" class="text-gray-400"
+                                              :title="'同向连续 ' + s._dupCount + ' 次 (历史), 已合并'"
+                                              x-text="' ×' + s._dupCount"></span>
+                                    </td>
+                                    <td>
+                                        <button type="button" class="stock-kline-link order-stock-link"
+                                                @click="signalBook.show = false; openKlineModal(s.code, { name: stockDisplayName(s.code) })"
+                                                :title="stockDisplayName(s.code) + ' ' + s.code">
+                                            <span class="order-stock-name" x-text="stockDisplayName(s.code)"></span>
+                                            <span class="order-stock-code" x-text="s.code"></span>
+                                        </button>
+                                    </td>
+                                    <td>
+                                        <span class="badge"
+                                              :class="s.side === 'buy' ? 'badge-success' : 'badge-danger'"
+                                              x-text="s.side"></span>
+                                    </td>
+                                    <td class="text-xs text-gray-600"
+                                        x-text="strategyLabel(s.strategy) || '-'"></td>
+                                    <td class="text-xs text-gray-600"
+                                        :title="s.reason || ''"
+                                        x-text="s.reason || '-'"></td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </template>
+            </div>
+        </div>
+    </div>
+
+    <!-- 成交流水全部: 右侧卡片只露最近几条, 点更多看全表 -->
+    <div class="modal-overlay" x-show="orderBook.show" x-cloak @click.self="orderBook.show = false">
+        <div class="modal-card" style="max-width:760px;">
+            <div class="modal-header">
+                <div class="modal-title">
+                    成交流水
+                    <span class="text-xs text-gray-500 font-normal ml-2"
+                          x-text="allOrders().length + ' 条'"></span>
+                </div>
+                <button type="button" class="modal-close" @click="orderBook.show = false">×</button>
+            </div>
+            <div class="modal-body text-sm" style="max-height:70vh; overflow-y:auto;">
+                <template x-if="allOrders().length === 0">
+                    <div class="text-gray-400 text-xs py-3 text-center">暂无成交</div>
+                </template>
+                <template x-if="allOrders().length > 0">
+                    <table class="app-table">
+                        <thead><tr>
+                            <th>时间</th><th>股票</th><th>方向</th>
+                            <th class="text-right">数量</th>
+                            <th class="text-right">价格</th>
+                            <th>策略</th>
+                        </tr></thead>
+                        <tbody>
+                            <template x-for="(o, i) in allOrders()" :key="'all-ord-' + i + '-' + (o.ts || '')">
+                                <tr>
+                                    <td class="num text-xs" x-text="App.fmtSignalTs(o.ts)"></td>
+                                    <td>
+                                        <button type="button" class="stock-kline-link stock-cell-btn"
+                                                @click="orderBook.show = false; openKlineModal(o.code, { name: stockDisplayName(o.code) })"
+                                                :title="'查看 ' + stockDisplayName(o.code) + ' (' + o.code + ') 日 K 线'">
+                                            <span class="stock-cell-name"
+                                                  x-show="stockDisplayName(o.code) !== o.code"
+                                                  x-text="stockDisplayName(o.code)"></span>
+                                            <span class="stock-cell-code" x-text="o.code"></span>
+                                        </button>
+                                    </td>
+                                    <td>
+                                        <span class="badge"
+                                              :class="o.side === 'buy' ? 'badge-success' : 'badge-danger'"
+                                              x-text="o.side"></span>
+                                    </td>
+                                    <td class="text-right num text-xs" x-text="o.quantity"></td>
+                                    <td class="text-right num text-xs" x-text="App.fmtNum(o.price, 2)"></td>
+                                    <td class="text-xs text-gray-600"
+                                        x-text="strategyLabel(o.strategy) || o.strategy || '—'"></td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </template>
+            </div>
+        </div>
+    </div>
+
+    <!-- 策略详情 + 切换 (持仓表 / 绑定表 共用): 点策略名弹出, 直接看说明并切换 -->
+    <div class="modal-overlay modal-overlay-top" x-show="strategyDetailForPos.show" x-cloak
+         @click.self="strategyDetailForPos.show = false">
+        <div class="modal-card strategy-help-modal" style="max-width:480px;">
+            <div class="modal-header">
+                <div class="modal-title">
+                    策略说明
+                    <span class="text-xs text-gray-500 font-mono ml-2"
+                          x-show="strategyDetailForPos.code"
+                          x-text="strategyDetailForPos.code"></span>
+                </div>
+                <button type="button" class="modal-close" @click="strategyDetailForPos.show = false">×</button>
+            </div>
+            <div class="modal-body">
+                <div class="strategy-help-title">
+                    当前: <span x-text="strategyDetailForPos.label"></span>
+                </div>
+
+                <template x-if="strategyDetailForPos.scenario || strategyDetailForPos.rules || strategyDetailForPos.example">
+                    <div>
+                        <div class="strategy-help-block" x-show="strategyDetailForPos.scenario">
+                            <div class="strategy-help-label">适用场景</div>
+                            <p class="strategy-help-text" x-text="strategyDetailForPos.scenario"></p>
+                        </div>
+                        <div class="strategy-help-block" x-show="strategyDetailForPos.rules">
+                            <div class="strategy-help-label">规则说明</div>
+                            <p class="strategy-help-text" x-text="strategyDetailForPos.rules"></p>
+                        </div>
+                        <div class="strategy-help-block" x-show="strategyDetailForPos.example">
+                            <div class="strategy-help-label">示例</div>
+                            <p class="strategy-help-text" x-text="strategyDetailForPos.example"></p>
+                        </div>
+                    </div>
+                </template>
+                <template x-if="!(strategyDetailForPos.scenario || strategyDetailForPos.rules || strategyDetailForPos.example) && strategyDetailForPos.desc">
+                    <p class="strategy-help-text" x-text="strategyDetailForPos.desc"></p>
+                </template>
+
+                <!-- 直接切换为其他策略 (无需再去右侧表格) -->
+                <div class="strategy-help-block" style="border-top:1px solid #e5e7eb;padding-top:10px;margin-top:14px;"
+                     x-show="strategyDetailForPos.code">
+                    <div class="strategy-help-label">切换为其他策略</div>
+                    <div class="flex gap-2 mt-1.5">
+                        <select class="form-input flex-1" style="font-size:12px;padding:4px 8px;"
+                                x-model="strategyDetailForPos.switchTo">
+                            <option value="" style="color:#9ca3af;">(不绑定 — 该股不再出信号)</option>
+                            <template x-for="s in strategyFlat" :key="'sw-' + s.name">
+                                <option :value="s.name" x-text="'[' + s.group + '] ' + s.label"></option>
+                            </template>
+                        </select>
+                        <button type="button" class="btn btn-primary btn-sm"
+                                style="padding:4px 12px;font-size:12px;"
+                                @click="confirmSwitchStrategy()"
+                                :disabled="strategyDetailForPos.switchTo === resolvedExecStrategy(strategyDetailForPos.code)
+                                           && hasBinding(strategyDetailForPos.code) === !!strategyDetailForPos.switchTo">
+                            保存
+                        </button>
+                    </div>
+                    <p class="text-xs text-gray-500 mt-1.5 mb-0 leading-relaxed">
+                        选「<b>(不绑定)</b>」保存 = 解绑, 引擎不再出信号; 选具体策略 = 切换并热加载,
+                        下一轮循环 (约 1 分钟) 生效。配置写入 <code>strategies.yaml</code>。
+                    </p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 日 K 线图弹窗: 点持仓代码 / 名称打开 -->
+    <div class="modal-overlay" x-show="klineModal.show" x-cloak
+         @wheel="if (!$event.target.closest('.kline-modal-card')) $event.preventDefault()"
+         @touchmove="if (!$event.target.closest('.kline-modal-card')) $event.preventDefault()">
+        <div class="modal-card kline-modal-card" @click.stop>
+            <div class="modal-header">
+                <div class="modal-title kline-modal-title">
+                    <span x-text="klineModal.name || '—'"></span>
+                    <code class="kline-modal-code" x-text="klineModal.code"></code>
+                    <template x-if="klineModal.stats">
+                        <span class="kline-modal-price"
+                              :class="(klineModal.stats.change_pct || 0) >= 0 ? 'up' : 'down'">
+                            <span x-text="App.fmtNum(klineModal.stats.last_close, 2)"></span>
+                            <span class="kline-modal-chg"
+                                  x-text="(klineModal.stats.change_pct >= 0 ? '+' : '')
+                                          + (klineModal.stats.change_pct * 100).toFixed(2) + '%'"></span>
+                        </span>
+                    </template>
+                </div>
+                <button type="button" class="modal-close" @click="closeKlineModal()">×</button>
+            </div>
+            <div class="modal-body kline-modal-body">
+                <div class="kline-modal-toolbar">
+                    <div class="kline-period-tabs">
+                        <template x-for="opt in [{n:60,label:'60日'},{n:120,label:'120日'},{n:250,label:'250日'}]"
+                                  :key="'kp-' + opt.n">
+                            <button type="button" class="kline-period-btn"
+                                    :class="klineModal.count === opt.n ? 'active' : ''"
+                                    @click="setKlinePeriod(opt.n)"
+                                    x-text="opt.label"></button>
+                        </template>
+                    </div>
+                    <div class="kline-modal-meta text-xs text-gray-500" x-show="klineModal.stats">
+                        <span>区间
+                            <b x-text="klineModal.stats ? App.fmtPct(klineModal.stats.period_ret, 2) : ''"></b>
+                        </span>
+                        <span class="ml-2">高
+                            <b x-text="klineModal.stats ? App.fmtNum(klineModal.stats.period_high, 2) : ''"></b>
+                        </span>
+                        <span class="ml-2">低
+                            <b x-text="klineModal.stats ? App.fmtNum(klineModal.stats.period_low, 2) : ''"></b>
+                        </span>
+                        <span class="ml-2" x-show="klineModal.cost > 0">成本
+                            <b x-text="App.fmtNum(klineModal.cost, 2)"></b>
+                        </span>
+                    </div>
+                </div>
+                <div x-show="klineModal.loading" class="kline-modal-status">加载日 K 中…</div>
+                <div x-show="!klineModal.loading && klineModal.error"
+                     class="kline-modal-status kline-modal-error" x-text="klineModal.error"></div>
+                <div id="live-kline-chart" class="kline-chart-box"
+                     x-show="!klineModal.loading && !klineModal.error"></div>
+                <p class="kline-modal-foot">日 K · 前复权 · 与回测同源 · 红涨绿跌 · MA5/10/20 · 红三角买 / 绿三角卖</p>
+                <div class="kline-trade-block">
+                    <div class="kline-trade-title">
+                        买卖记录
+                        <span class="text-gray-400 font-normal"
+                              x-text="tradesForCode(klineModal.code).length + ' 笔'"></span>
+                    </div>
+                    <template x-if="tradesForCode(klineModal.code).length === 0">
+                        <div class="text-gray-400 text-xs py-3 text-center">该股暂无成交</div>
+                    </template>
+                    <template x-if="tradesForCode(klineModal.code).length > 0">
+                        <table class="app-table kline-trade-table">
+                            <thead>
+                                <tr>
+                                    <th>日期</th>
+                                    <th>方向</th>
+                                    <th class="text-right">数量</th>
+                                    <th class="text-right">价格</th>
+                                    <th>策略</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <template x-for="(t, i) in tradesForCode(klineModal.code)" :key="t.date + '-' + t.side + '-' + i">
+                                    <tr>
+                                        <td class="num" x-text="t.date"></td>
+                                        <td>
+                                            <span :class="t.side === 'buy' ? 'text-red-600' : 'text-green-600'"
+                                                  x-text="t.side === 'buy' ? '买' : '卖'"></span>
+                                        </td>
+                                        <td class="text-right num" x-text="App.fmtNum(t.quantity, 0)"></td>
+                                        <td class="text-right num" x-text="App.fmtNum(t.price, 2)"></td>
+                                        <td class="text-xs text-gray-600" x-text="strategyLabel(t.strategy) || t.strategy || '—'"></td>
+                                    </tr>
+                                </template>
+                            </tbody>
+                        </table>
+                    </template>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 立即试算结果弹窗: 展示每只股票的 buy/sell/hold + 原因 -->
+    <div class="modal-overlay" x-show="trialResult !== null" x-cloak @click.self="trialResult = null">
+        <div class="modal-card" style="max-width:760px;">
+            <div class="modal-header">
+                <div class="modal-title">
+                    试算结果
+                    <span class="text-xs text-gray-500 ml-2" x-show="trialResult"
+                          x-text="'共 ' + (trialResult?.summary?.total || 0) + ' 只'"></span>
+                </div>
+                <button type="button" class="modal-close" @click="trialResult = null">×</button>
+            </div>
+            <div class="modal-body" x-show="trialResult">
+                <div class="text-xs text-gray-700 mb-3 leading-relaxed">
+                    引擎按当前最近一根 K 线对监控池里每只股票各跑一遍策略。
+                    <b class="text-emerald-700">buy</b> / <b class="text-rose-700">sell</b> 已写到下方「信号」表;
+                    <b class="text-gray-500">hold</b> 表示当前条件不满足, 不出信号 (这就是「为什么没看到信号」的常见原因)。
+                </div>
+                <div class="flex gap-3 text-sm mb-3">
+                    <span class="badge badge-success" x-text="'buy ' + (trialResult?.summary?.buy || 0)"></span>
+                    <span class="badge badge-danger"  x-text="'sell ' + (trialResult?.summary?.sell || 0)"></span>
+                    <span class="badge badge-info"    style="background:#f3f4f6;color:#374151;"
+                          x-text="'hold ' + (trialResult?.summary?.hold || 0)"></span>
+                    <template x-if="(trialResult?.summary?.error || 0) > 0">
+                        <span class="badge badge-danger"
+                              x-text="'error ' + trialResult.summary.error"></span>
+                    </template>
+                </div>
+                <table class="app-table" x-show="(trialResult?.diagnoses || []).length > 0">
+                    <thead><tr>
+                        <th>代码</th><th>策略</th><th>方向</th><th>原因</th>
+                    </tr></thead>
+                    <tbody>
+                        <template x-for="(d, i) in (trialResult?.diagnoses || [])" :key="i">
+                            <tr>
+                                <td><code x-text="d.code"></code></td>
+                                <td>
+                                    <span class="badge badge-info" style="font-size:10px;"
+                                          x-text="d.strategy"></span>
+                                </td>
+                                <td>
+                                    <span class="badge"
+                                          :class="d.side === 'buy' ? 'badge-success' :
+                                                  d.side === 'sell' ? 'badge-danger' :
+                                                  d.side === 'error' ? 'badge-danger' : ''"
+                                          :style="d.side === 'hold' ? 'background:#f3f4f6;color:#6b7280;' : ''"
+                                          x-text="d.side"></span>
+                                </td>
+                                <td class="text-xs text-gray-600" x-text="d.reason || '-'"></td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-primary" @click="trialResult = null">知道了</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 实盘委托弹窗 (从「实盘账户」卡片头部按钮点开) -->
+    <div class="modal-overlay" x-show="showRealOrders" x-cloak @click.self="showRealOrders = false">
+        <div class="modal-card" style="max-width:780px;">
+            <div class="modal-header">
+                <div class="modal-title">
+                    今日委托 ({{ qmt_backend }})
+                    <span class="text-xs text-gray-500 ml-2"
+                          x-text="(realAccount.orders || []).length + ' 笔'
+                                  + (pendingRealOrders().length ? ' · 未结 ' + pendingRealOrders().length : '')"></span>
+                </div>
+                <button type="button" class="modal-close" @click="showRealOrders = false">×</button>
+            </div>
+            <div class="modal-body">
+                <template x-if="(realAccount.orders || []).length === 0">
+                    <div class="text-gray-400 text-sm py-6 text-center">(今日暂无委托)</div>
+                </template>
+                <template x-if="(realAccount.orders || []).length > 0">
+                    <div class="overflow-x-auto">
+                    <table class="app-table">
+                        <thead><tr>
+                            <th>编号</th>
+                            <th>代码</th>
+                            <th>方向</th>
+                            <th class="text-right">委托</th>
+                            <th class="text-right">已成</th>
+                            <th class="text-right">价格</th>
+                            <th>状态</th>
+                            <th>操作</th>
+                        </tr></thead>
+                        <tbody>
+                            <template x-for="o in (realAccount.orders || [])" :key="o.order_id">
+                                <tr>
+                                    <td><code class="text-xs" x-text="o.order_id"></code></td>
+                                    <td><code x-text="o.stock_code"></code></td>
+                                    <td>
+                                        <span class="badge"
+                                              :class="o.side === 'buy' ? 'badge-danger' : 'badge-success'"
+                                              x-text="o.side === 'buy' ? '买' : (o.side === 'sell' ? '卖' : o.side)"></span>
+                                    </td>
+                                    <td class="text-right num" x-text="App.fmtNum(o.order_volume, 0)"></td>
+                                    <td class="text-right num" x-text="App.fmtNum(o.traded_volume, 0)"></td>
+                                    <td class="text-right num" x-text="o.price > 0 ? App.fmtNum(o.price, 2) : '市价'"></td>
+                                    <td>
+                                        <span class="text-xs"
+                                              :class="o.cancelable ? 'text-yellow-700' : (o.order_status === 57 ? 'text-green-700' : 'text-gray-500')"
+                                              x-text="o.status_text"></span>
+                                    </td>
+                                    <td>
+                                        <button type="button" class="btn btn-secondary btn-xs"
+                                                x-show="o.cancelable"
+                                                :disabled="cancelBusyId === o.order_id"
+                                                @click="cancelRealOrder(o)"
+                                                x-text="cancelBusyId === o.order_id ? '撤单中...' : '撤单'"></button>
+                                    </td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                    </div>
+                </template>
+                <p class="text-xs text-gray-400 mt-3 mb-0 leading-relaxed">
+                    数据来自 QMT <code>query_orders()</code>（HTTP/miniQMT 双后端）, 自动 5 秒刷新。
+                    未结(未报/待报/已报/部成待撤) 可撤单; 已成 / 已撤为终态。
+                </p>
+            </div>
+        </div>
+    </div>
+
+    <!-- 顶部视图切换: 模拟盘 / 实盘 -- 用独立 URL (/live/sim, /live/real), 可分享 / 收藏 -->
+    <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
+        <div class="inline-flex rounded-md overflow-hidden border border-gray-200 bg-white shadow-sm">
+            <a href="/live/sim"
+               class="px-5 py-2 text-sm font-medium transition-colors no-underline"
+               :class="viewMode === 'sim' ? 'bg-indigo-600 text-white' : 'text-gray-700 hover:bg-gray-50'">
+                模拟盘
+            </a>
+            <a href="/live/real"
+               class="px-5 py-2 text-sm font-medium transition-colors border-l border-gray-200 no-underline"
+               :class="viewMode === 'real' ? 'bg-red-600 text-white' : 'text-gray-700 hover:bg-gray-50'">
+                实盘
+            </a>
+        </div>
+        <div class="text-xs text-gray-500" x-show="viewMode === 'sim'">
+            模拟盘 (<code>/live/sim</code>): 自动跑策略, 不会真实下单
+        </div>
+        <div class="text-xs text-red-700" x-show="viewMode === 'real'">
+            实盘 (<code>/live/real</code>): 持仓 / 资金来自 {{ qmt_backend }}; 下单走「AI 信号 → 手动授权」, 引擎不直接下单
+        </div>
+    </div>
+
+    <!-- ======== 模拟盘视图 ======== -->
+    <div class="grid-2" x-show="viewMode === 'sim'" x-cloak>
+        <!-- 左侧: 持仓 + 盈亏曲线 + 信号订单 (系统状态已移到右侧) -->
+        <div class="flex-col">
+
+            <!-- 持仓: 已成交 + 已绑策略但 0 股 (灰色待入场) 一并显示 -->
+            <div class="card">
+                <div class="card-header card-header-plain">
+                    <div class="flex items-baseline gap-2 min-w-0">
+                        <div class="card-title">实时持仓</div>
+                        <span class="text-gray-400" style="font-size:11px;font-weight:400;">
+                            <span x-text="heldCount() + ' 只持仓'"></span>
+                            <span x-show="pendingEntryCount() > 0"
+                                  x-text="' · ' + pendingEntryCount() + ' 只待入场'"></span>
+                            <span x-show="watchOnlyCount() > 0"
+                                  x-text="' · ' + watchOnlyCount() + ' 只监控'"></span>
+                            <span> · 待入场会开仓，监控只看</span>
+                        </span>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <button type="button" class="btn btn-secondary btn-sm"
+                                style="padding:3px 12px;font-size:12px;"
+                                @click="openPosAlloc()" title="分档、看目标金额与当前市值">
+                            仓位管理
+                        </button>
+                        <button type="button" class="btn btn-primary btn-sm"
+                                style="padding:3px 12px;font-size:12px;"
+                                @click="openStockBind()" title="新增标的并绑定策略">
+                            + 添加股票
+                        </button>
+                    </div>
+                </div>
+                <template x-if="displayPositions().length === 0">
+                    <div class="text-gray-400 text-sm py-6 text-center">(暂无标的 — 点右侧「添加股票」绑定策略)</div>
+                </template>
+                <template x-if="displayPositions().length > 0">
+                    <div class="overflow-x-auto">
+                    <table class="app-table">
+                        <thead><tr>
+                            <th>股票</th>
+                            <th>执行策略</th>
+                            <th class="text-right">持仓</th>
+                            <th class="text-right">成本</th>
+                            <th class="text-right">现价</th>
+                            <th class="text-right">市值</th>
+                            <th class="text-right">累计盈亏</th>
+                            <th class="text-right">盈亏%</th>
+                        </tr></thead>
+                        <tbody>
+                            <template x-for="p in displayPositions()" :key="p.code">
+                                <tr :class="p._zero ? 'text-gray-400' : ''">
+                                    <td>
+                                        <div class="stock-cell">
+                                            <button type="button" class="stock-kline-link stock-cell-btn"
+                                                    @click="openKlineModal(p.code, { name: p.name, cost: p.cost })"
+                                                    :title="'查看 ' + (p.name || p.code) + ' 日 K 线'">
+                                                <span class="stock-cell-name"
+                                                      x-show="p.name && p.name !== p.code"
+                                                      x-text="p.name"></span>
+                                                <span class="stock-cell-code" x-text="p.code"></span>
+                                            </button>
+                                            <span x-show="p._zero && hasSlot(p.code)"
+                                                  class="badge badge-info stock-pending-badge">待入场</span>
+                                            <span x-show="p._zero && !hasSlot(p.code)"
+                                                  class="badge badge-gray stock-pending-badge">监控</span>
+                                        </div>
+                                    </td>
+                                    <td>
+                                        <button type="button" class="text-indigo-600 hover:underline text-xs text-left"
+                                                @click="openPositionStrategyModal(p.code)"
+                                                :title="'策略 id: ' + resolvedExecStrategy(p.code) + ' (点击查看说明 / 切换)'"
+                                                x-text="resolvedExecStrategyLabel(p.code)"></button>
+                                    </td>
+                                    <td class="text-right num">
+                                        <span x-show="!p._zero" x-text="App.fmtNum(p.volume, 0)"></span>
+                                        <span x-show="p._zero">0</span>
+                                    </td>
+                                    <td class="text-right num">
+                                        <span x-show="!p._zero" x-text="App.fmtNum(p.cost, 2)"></span>
+                                        <span x-show="p._zero">—</span>
+                                    </td>
+                                    <td class="text-right num" x-text="App.fmtNum(p.cur_price, 2)"></td>
+                                    <td class="text-right num">
+                                        <span x-show="!p._zero" x-text="App.fmtNum(p.market_value, 0)"></span>
+                                        <span x-show="p._zero">0</span>
+                                    </td>
+                                    <td class="text-right num" :class="App.pnlClass(p.pnl)"
+                                        x-text="App.fmtSign(p.pnl, 0)"></td>
+                                    <td class="text-right num" :class="App.pnlClass(p.pnl_pct)"
+                                        x-text="App.fmtPct(p.pnl_pct, 2)"></td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                    </div>
+                </template>
+            </div>
+
+            <!-- 信号: 倒序 (最近在上), 含 SIM_HISTORY_START_DATE (默认 2026-04-01) 至今的历史回放
+                 订单 (= 模拟撮合成交流水) 移到右侧资金面板下方, 信号占整行 -->
+            <div class="card">
+                <div class="card-header card-header-plain">
+                    <div class="flex items-baseline gap-2 min-w-0">
+                        <div class="card-title">信号</div>
+                        <span class="text-gray-400" style="font-size:11px;font-weight:400;">方向变化才记一条，连续同向已合并。hover 策略看原因</span>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <span class="text-xs text-gray-400"
+                              x-text="allSignals().length + ' 条'"></span>
+                        <button type="button" class="text-xs text-indigo-600 hover:underline"
+                                x-show="allSignals().length > 8"
+                                @click="signalBook.show = true">更多</button>
+                    </div>
+                </div>
+                <template x-if="recentSignals().length === 0">
+                    <div class="text-gray-400 text-sm py-3 text-center">(暂无信号 -- 等待盘中策略触发)</div>
+                </template>
+                <template x-if="recentSignals().length > 0">
+                    <table class="app-table">
+                        <thead><tr>
+                            <th style="width:140px;">时间</th>
+                            <th style="width:120px;">股票</th>
+                            <th style="width:60px;">方向</th>
+                            <th style="width:160px;">策略</th>
+                            <th>原因</th>
+                        </tr></thead>
+                        <tbody>
+                            <template x-for="(s, i) in recentSignals()" :key="i">
+                                <tr>
+                                    <td class="num text-xs">
+                                        <span x-text="App.fmtSignalTs(s.ts)"></span>
+                                        <span x-show="s._dupCount > 1" class="text-gray-400"
+                                              :title="'同向连续 ' + s._dupCount + ' 次 (历史), 已合并'"
+                                              x-text="' ×' + s._dupCount"></span>
+                                    </td>
+                                    <td>
+                                        <button type="button" class="stock-kline-link stock-cell-btn"
+                                                @click="openKlineModal(s.code, { name: stockDisplayName(s.code) })"
+                                                :title="'查看 ' + stockDisplayName(s.code) + ' (' + s.code + ') 日 K 线'">
+                                            <span class="stock-cell-name"
+                                                  x-show="stockDisplayName(s.code) !== s.code"
+                                                  x-text="stockDisplayName(s.code)"></span>
+                                            <span class="stock-cell-code" x-text="s.code"></span>
+                                        </button>
+                                    </td>
+                                    <td>
+                                        <span class="badge"
+                                              :class="s.side === 'buy' ? 'badge-success' : 'badge-danger'"
+                                              x-text="s.side"></span>
+                                    </td>
+                                    <td>
+                                        <span class="text-xs text-gray-600"
+                                              :title="(s.reason || '') + ' (' + (s.strategy || '') + ')'"
+                                              x-text="strategyLabel(s.strategy) || '-'"></span>
+                                    </td>
+                                    <td class="text-xs text-gray-600"
+                                        style="max-width:360px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
+                                        :title="s.reason || ''"
+                                        x-text="s.reason || '-'"></td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </template>
+            </div>
+
+            <!-- 资金曲线: 累计盈亏% 自模拟盘开盘起
+                 数据 = state.pnl_history; 启动时回放 [start_date, 昨天] 每日点 + worker 每分钟实时点 -->
+            <div class="card">
+                <div class="card-header card-header-plain">
+                    <div class="flex items-baseline gap-2 min-w-0">
+                        <div class="card-title">资金曲线</div>
+                        <span class="text-gray-400" style="font-size:11px;font-weight:400;">累计盈亏%</span>
+                    </div>
+                    <div class="flex gap-1">
+                        <button class="btn btn-sm"
+                                :class="chartMode === 'all' ? 'btn-primary' : 'btn-secondary'"
+                                style="padding:3px 10px;font-size:11px;"
+                                title="自起始日每个交易日一点，加上今天分时"
+                                @click="chartMode = 'all'; renderChart();">至今</button>
+                        <button class="btn btn-sm"
+                                :class="chartMode === 'today' ? 'btn-primary' : 'btn-secondary'"
+                                style="padding:3px 10px;font-size:11px;"
+                                title="今天 9:30 起，跳过午休"
+                                @click="chartMode = 'today'; renderChart();">今日</button>
+                    </div>
+                </div>
+                <div id="pnl-chart" style="height:240px;"></div>
+            </div>
+
+        </div>
+
+        <!-- 右侧: 快速指南 + 系统状态 + 运行控制 + 策略路由 + 应急 -->
+        <div class="flex-col">
+
+            <!-- 资金面板 (合并 = 资产视图 + 运行控制 + 操作链接)
+                 设计目标: 用一张卡装下"我现在多少钱 / 引擎在不在跑 / 出问题怎么停",
+                 不再单独立"运行控制 / 快速指南"卡, 减少视觉噪音 -->
+            <div class="card">
+                <div class="card-header" style="padding-bottom:0.6rem;">
+                    <div class="flex items-center gap-2">
+                        <div class="card-title">资金面板</div>
+                        <span class="badge text-xs"
+                              :class="state.trading_status === 'RUNNING' ? 'badge-success' :
+                                      state.trading_status === 'PAUSED'  ? 'badge-warning' :
+                                      state.trading_status === 'HALTED'  ? 'badge-danger' : 'badge-gray'"
+                              x-text="state.trading_status || 'UNKNOWN'"></span>
+                    </div>
+                    <div class="flex items-center gap-1">
+                        <!-- 运行中: 紧凑停止按钮 -->
+                        <button type="button" x-show="sim.running"
+                                class="btn btn-secondary"
+                                style="padding:2px 10px;font-size:11px;line-height:1.3;"
+                                @click="simStop()" title="停止后台循环">停止</button>
+                        <!-- 已停止: 紧凑启动按钮 (停止是异常态, 这里只给 1 键启动 + 模式从下方切) -->
+                        <button type="button" x-show="!sim.running"
+                                class="btn btn-primary"
+                                style="padding:2px 10px;font-size:11px;line-height:1.3;"
+                                @click="simStart()" title="重新启动后台循环 (模拟)">启动</button>
+                        <button type="button" class="help-btn" @click="showHelp = true" title="使用说明">?</button>
+                    </div>
+                </div>
+
+                <!-- 总资产 (大字) -->
+                <div class="text-center pb-3 border-b border-gray-100">
+                    <div class="text-xs text-gray-500">总资产</div>
+                    <div class="text-3xl num font-bold leading-tight"
+                         x-text="App.fmtNum(totalAssets(), 0)"></div>
+                    <div class="text-sm mt-0.5">
+                        <span :class="App.pnlClass(state.today_pnl)"
+                              x-text="App.fmtSign(state.today_pnl || 0, 0)"></span>
+                        <span :class="App.pnlClass(state.today_pnl)"
+                              x-text="' (' + App.fmtPct(state.today_pnl_pct || 0, 2) + ')'"></span>
+                        <span class="text-gray-400 text-xs ml-1">vs 初始
+                            <span class="num" x-text="App.fmtNum(state.capital || 0, 0)"></span>
+                        </span>
+                    </div>
+                </div>
+
+                <!-- 持仓市值 + 可用现金 -->
+                <div class="grid grid-cols-2 gap-3 text-sm pt-3 pb-3 border-b border-gray-100">
+                    <div>
+                        <div class="text-xs text-gray-500">持仓市值</div>
+                        <div class="num text-lg font-semibold text-indigo-700"
+                             x-text="App.fmtNum(holdingsValue(), 0)"></div>
+                        <div class="text-xs text-gray-500">
+                            占 <span x-text="App.fmtPct(holdingsRatio(), 1)"></span> ·
+                            <span x-text="(state.positions || []).length"></span> 只
+                        </div>
+                    </div>
+                    <div>
+                        <div class="text-xs text-gray-500">可用现金</div>
+                        <div class="num text-lg font-semibold text-emerald-700"
+                             x-text="App.fmtNum(cashAvailable(), 0)"></div>
+                        <div class="text-xs text-gray-500">
+                            占 <span x-text="App.fmtPct(cashRatio(), 1)"></span>
+                            <span class="text-gray-400" x-show="cashAvailable() > 0"> · 可加仓</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 已停止时给个明显提示 + 模式切换 (可选) -->
+                <div x-show="!sim.running" class="mt-2 text-xs">
+                    <span class="text-amber-700">引擎已停止 -- </span>
+                    <button type="button" class="text-indigo-600 hover:underline mr-2"
+                            @click="dryRun = true" :class="dryRun ? 'font-semibold' : ''">模拟</button>
+                    <button type="button" class="text-rose-600 hover:underline"
+                            @click="setRealMode()" :class="!dryRun ? 'font-semibold' : ''">实盘</button>
+                    <span class="text-gray-400 ml-1">(选完点上方「启动」)</span>
+                </div>
+
+                <div class="text-xs text-red-600 mt-1.5" x-show="sim.last_error"
+                     x-text="'报错: ' + sim.last_error"></div>
+
+                <div class="text-xs text-gray-600 pt-2.5">
+                    监控 <b class="text-gray-900" x-text="(mergedList || []).length"></b> 只
+                    <span x-show="sim.cycle_count > 0">
+                        · 已跑 <b class="text-gray-900" x-text="sim.cycle_count"></b> 轮
+                    </span>
+                </div>
+                <div class="mt-2 pt-2 border-t border-gray-100 flex items-center justify-between text-xs">
+                    <button type="button" class="text-gray-600 hover:text-indigo-700 hover:underline"
+                            @click="openResetBook()" title="按当前股票、策略、档位和起始日重新回放">重置模拟盘</button>
+                    <span class="text-gray-400 font-mono" x-show="simUpdatedAt()"
+                          x-text="simUpdatedAt() + ' 更新'"></span>
+                </div>
+            </div>
+
+            <!-- 成交流水: 主循环把信号成交后写入 state.orders 的记录
+                 dry-run 模式 = 模拟撮合 (写盘但不真下单); /live/real 模式 = 真实 QMT 委托回执 -->
+            <div class="card">
+                <div class="card-header card-header-plain">
+                    <div class="flex items-baseline gap-2 min-w-0">
+                        <div class="card-title">成交流水</div>
+                        <span class="text-gray-400" style="font-size:11px;font-weight:400;">信号成交后写入</span>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <span class="text-xs text-gray-400" x-text="allOrders().length + ' 条'"></span>
+                        <button type="button" class="text-xs text-indigo-600 hover:underline"
+                                x-show="allOrders().length > 5"
+                                @click="orderBook.show = true">更多</button>
+                    </div>
+                </div>
+                <template x-if="recentOrders().length === 0">
+                    <div class="text-gray-400 text-xs py-3 text-center leading-relaxed">
+                        暂无成交<br/>
+                        <span class="text-gray-300">下一笔买/卖信号触发后会写入这里</span>
+                    </div>
+                </template>
+                <template x-if="recentOrders().length > 0">
+                    <div>
+                        <table class="app-table order-preview-table">
+                            <thead><tr>
+                                <th class="order-col-ts">时间</th>
+                                <th>股票</th>
+                                <th class="order-col-side">方向</th>
+                                <th class="order-col-num text-right">数量</th>
+                                <th class="order-col-num text-right">价格</th>
+                            </tr></thead>
+                            <tbody>
+                                <template x-for="(o, i) in recentOrders()" :key="i">
+                                    <tr :title="(o.strategy || '') + ' | ' + (o.status || '')">
+                                        <td class="num text-xs order-col-ts" x-text="App.fmtSignalTs(o.ts)"></td>
+                                        <td>
+                                            <button type="button" class="stock-kline-link order-stock-link"
+                                                    @click="openKlineModal(o.code, { name: stockDisplayName(o.code) })"
+                                                    :title="stockDisplayName(o.code) + ' ' + o.code">
+                                                <span class="order-stock-name"
+                                                      x-text="stockDisplayName(o.code)"></span>
+                                                <span class="order-stock-code" x-text="o.code"></span>
+                                            </button>
+                                        </td>
+                                        <td>
+                                            <span class="badge"
+                                                  :class="o.side === 'buy' ? 'badge-success' : 'badge-danger'"
+                                                  x-text="o.side"></span>
+                                        </td>
+                                        <td class="text-right num text-xs" x-text="o.quantity"></td>
+                                        <td class="text-right num text-xs" x-text="App.fmtNum(o.price, 2)"></td>
+                                    </tr>
+                                </template>
+                            </tbody>
+                        </table>
+                    </div>
+                </template>
+            </div>
+
+            <!-- (运行控制 / 股票与策略 / 快速指南 三张卡片已合并:
+                 · 启动/停止/状态 -> 资金面板头部
+                 · 添加股票 -> 左侧「实时持仓」card-header
+                 · 快速指南完整版 -> 右上角 ? 帮助弹窗) -->
+            <template x-if="strategiesLoadError">
+                <div class="card" style="border-color:#fecaca;">
+                    <div class="text-red-600 text-xs" x-text="strategiesLoadError"></div>
+                </div>
+            </template>
+
+            <!-- 风控 / 熔断 / 下单 (固定说明) -->
+            <div class="card">
+                <div class="card-title mb-3">风控 / 熔断 / 下单</div>
+                <div class="text-xs text-gray-700 space-y-2">
+                    <div class="flex items-start gap-2">
+                        <span class="badge badge-warning risk-tag">风控</span>
+                        <span>已分档才开仓，金额 = 总资金 ÷ 档数
+                            （当前 <b x-text="slotAmountText()"></b>），整手; 卖掉档还在; 涨过目标不减仓</span>
+                    </div>
+                    <div class="flex items-start gap-2">
+                        <span class="badge badge-danger risk-tag">熔断</span>
+                        <span>当日亏损 ≤ -2% 自动 HALTED</span>
+                    </div>
+                    <div class="flex items-start gap-2">
+                        <span class="badge badge-success risk-tag">下单</span>
+                        <span>模拟模式: 写到订单表, 不连券商</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 龙头战法候选 (CASE-C) -->
+            <div class="card">
+                <div class="card-header" style="cursor:pointer;border-bottom:none;padding-bottom:0;margin-bottom:0;"
+                     @click="dragon.show = !dragon.show">
+                    <div class="card-title flex items-center gap-2">
+                        <span x-text="dragon.show ? '▼' : '▶'" class="text-xs text-gray-400"></span>
+                        龙头战法候选
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <span x-show="dragon.tradeDate" class="badge badge-gray text-xs"
+                              x-text="dragon.tradeDate"></span>
+                        <span class="badge badge-info" x-text="dragon.items.length + ' 只'"></span>
+                    </div>
+                </div>
+                <div x-show="dragon.show" x-cloak class="mt-3" x-transition>
+                    <div class="text-xs text-gray-600 mb-2 leading-relaxed">
+                        <template x-if="dragon.versionMode === 'v2'">
+                            <div><b>选股 v2</b>：涨幅 5%–9.5%、价&lt;30、市值 30–500 亿、量比&gt;2、非 ST、上市≥60 日；MySQL 开板块共振，QMT 盘中无板块故共振关。</div>
+                        </template>
+                        <template x-if="dragon.versionMode === 'v1'">
+                            <div><b>选股 v1</b>：涨幅&gt;5%、榜前 50、市值 30–500 亿、量比&gt;2、非 ST、价&lt;30。不限涨停、次新、共振。</div>
+                        </template>
+                        <div class="mt-1"><b>战法</b>：一键加入监控后绑「龙头首板战法 v1/v2」，入场跟上面选股同一套硬过滤（不是龙头分≥1.5）。出场：当日跌幅&gt;3% 或从最高回撤&gt;3%。持仓策略列可再单独改。</div>
+                    </div>
+                    <div class="text-xs mb-2 text-gray-500">
+                        <template x-if="dragon.sourceMode === 'mysql'">
+                            <span>数据源: <b>MySQL</b> 最近一个真实交易日</span>
+                        </template>
+                        <template x-if="dragon.sourceMode === 'xtdata'">
+                            <span>数据源: <b>QMT</b> 实时盘中</span>
+                        </template>
+                        <span> · 版本 <b x-text="(dragon.versionMode || 'v2').toUpperCase()"></b></span>
+                    </div>
+                    <div class="flex items-center gap-2 mb-2 flex-wrap">
+                        <label class="text-xs text-gray-600 flex items-center gap-1">
+                            数据源
+                            <select class="form-input" style="font-size:12px;padding:2px 6px;height:auto;"
+                                    x-model="dragon.sourceMode">
+                                <option value="mysql">MySQL 最近交易日</option>
+                                <option value="xtdata">QMT 实时</option>
+                            </select>
+                        </label>
+                        <label class="text-xs text-gray-600 flex items-center gap-1">
+                            版本
+                            <select class="form-input" style="font-size:12px;padding:2px 6px;height:auto;"
+                                    x-model="dragon.versionMode"
+                                    @change="saveDragonVersion()">
+                                <option value="v2">v2 默认</option>
+                                <option value="v1">v1 对照</option>
+                            </select>
+                        </label>
+                        <button class="btn btn-secondary btn-sm" @click="loadDragonCandidates()" :disabled="dragon.loading">
+                            <span x-show="!dragon.loading">刷新候选</span>
+                            <span x-show="dragon.loading">加载中...</span>
+                        </button>
+                        <button class="btn btn-primary btn-sm ml-auto"
+                                :disabled="dragon.items.length === 0 || dragon.binding"
+                                @click="bindDragonAll()"
+                                title="把候选写入 watch_pool 并绑 dragon_picker 策略, 主循环下一轮自动盯">
+                            <span x-show="!dragon.binding">一键加入监控 (自动绑龙头战法)</span>
+                            <span x-show="dragon.binding">写入中...</span>
+                        </button>
+                    </div>
+                    <template x-if="dragon.warning">
+                        <div class="text-xs text-orange-600 mb-2"
+                             x-text="'数据源回退说明: ' + dragon.warning"></div>
+                    </template>
+                    <template x-if="!dragon.loaded && dragon.items.length === 0">
+                        <div class="text-gray-400 text-sm py-4 text-center">(点「刷新候选」)</div>
+                    </template>
+                    <template x-if="dragon.loaded && dragon.items.length === 0">
+                        <div class="text-gray-400 text-sm py-4 text-center">没有找到龙头</div>
+                    </template>
+                    <template x-if="dragon.items.length > 0">
+                        <div style="max-height: 240px; overflow-y: auto;">
+                            <table class="app-table text-xs">
+                                <thead><tr>
+                                    <th>代码</th><th>名称</th>
+                                    <th class="text-right">涨幅</th>
+                                    <th class="text-right">量比</th>
+                                    <th class="text-right">价</th>
+                                    <th>板块</th>
+                                    <th class="text-right">板块涨</th>
+                                    <th class="text-right">分</th>
+                                </tr></thead>
+                                <tbody>
+                                    <template x-for="r in dragon.items" :key="'dg-' + r.code">
+                                        <tr>
+                                            <td>
+                                                <button type="button" class="stock-kline-link font-mono"
+                                                        @click="openKlineModal(r.code, { name: r.name })"
+                                                        :title="'查看 ' + r.code + ' 日 K 线'"
+                                                        x-text="r.code"></button>
+                                            </td>
+                                            <td>
+                                                <button type="button" class="stock-kline-link"
+                                                        @click="openKlineModal(r.code, { name: r.name })"
+                                                        :title="'查看 ' + (r.name || r.code) + ' 日 K 线'"
+                                                        x-text="r.name"></button>
+                                            </td>
+                                            <td class="text-right num pos" x-text="App.fmtPct(r.day_change_pct, 2)"></td>
+                                            <td class="text-right num" x-text="App.fmtNum(r.volume_ratio, 1)"></td>
+                                            <td class="text-right num" x-text="App.fmtNum(r.price, 2)"></td>
+                                            <td x-text="r.sector_2 || '-'"></td>
+                                            <td class="text-right num" x-text="r.sector_change_pct == null ? '-' : App.fmtPct(r.sector_change_pct, 2)"></td>
+                                            <td class="text-right num" x-text="App.fmtSign(r.dragon_score, 2)"></td>
+                                        </tr>
+                                    </template>
+                                </tbody>
+                            </table>
+                        </div>
+                    </template>
+                </div>
+            </div>
+
+            <!-- 事件流 / 告警 (按级别上色) -->
+            <div class="card">
+                <div class="card-header" style="cursor:pointer;border-bottom:none;padding-bottom:0;margin-bottom:0;"
+                     @click="showEvents = !showEvents">
+                    <div class="card-title flex items-center gap-2">
+                        <span x-text="showEvents ? '▼' : '▶'" class="text-xs text-gray-400"></span>
+                        事件流 / 告警
+                    </div>
+                    <span class="badge badge-gray" x-text="(state.events || []).length + ' 条'"></span>
+                </div>
+                <div x-show="showEvents" x-cloak class="mt-3" x-transition>
+                    <div class="text-xs text-gray-500 mb-2">主循环每轮 + control/status 操作 + 推送告警 (CASE-B) 都会写入这里</div>
+                    <template x-if="(state.events || []).length === 0">
+                        <div class="text-gray-400 text-sm py-4 text-center">(暂无事件，启动模拟盘后会陆续写入)</div>
+                    </template>
+                    <template x-if="(state.events || []).length > 0">
+                        <div style="max-height: 280px; overflow-y: auto;">
+                            <template x-for="(e, idx) in (state.events || []).slice().reverse().slice(0, 30)" :key="'ev-' + idx">
+                                <div class="flex items-start gap-2 py-1 text-xs border-b border-gray-100 last:border-0">
+                                    <span class="badge" style="min-width:54px;text-align:center;flex-shrink:0;"
+                                          :class="App.alertBadgeClass(e)" x-text="App.alertLevelText(e)"></span>
+                                    <span class="text-gray-400 font-mono" x-text="App.alertTimeText(e)" style="min-width:60px;flex-shrink:0;"></span>
+                                    <span class="text-gray-700" style="word-break:break-all;" x-text="App.alertMsgText(e)"></span>
+                                </div>
+                            </template>
+                        </div>
+                    </template>
+                </div>
+            </div>
+
+            <!-- 应急干预 (默认折叠 -- 平时不用看到) -->
+            <div class="card" style="border-color: #fee2e2;">
+                <div class="card-header" style="cursor:pointer;border-bottom:none;padding-bottom:0;margin-bottom:0;"
+                     @click="showEmergency = !showEmergency">
+                    <div class="card-title flex items-center gap-2">
+                        <span x-text="showEmergency ? '▼' : '▶'" class="text-xs text-gray-400"></span>
+                        应急干预
+                    </div>
+                    <span class="badge badge-warning">平时不用</span>
+                </div>
+                <div x-show="showEmergency" x-cloak class="mt-3" x-transition>
+                    <div class="text-xs text-gray-500 mb-3">
+                        类似汽车手刹 -- 黑天鹅 / 策略失效 / 亏损过大时才用
+                    </div>
+
+                    <div class="grid grid-cols-2 gap-2">
+                        <button class="btn btn-secondary btn-sm" @click="ctrl('pause_buying', true)" title="只阻止 buy 信号, sell 仍执行">暂停买入</button>
+                        <button class="btn btn-secondary btn-sm" @click="ctrl('pause_buying', false)">恢复买入</button>
+                        <button class="btn btn-secondary btn-sm" @click="setStatus('PAUSED')" title="整个循环跳过">暂停交易</button>
+                        <button class="btn btn-primary btn-sm" @click="setStatus('RUNNING')">恢复交易</button>
+                        <button class="btn btn-danger btn-sm" @click="confirmDanger('force_clear_all')" title="所有持仓尽快平仓">一键清仓</button>
+                        <button class="btn btn-danger btn-sm" @click="confirmDanger('HALTED')" title="HALTED, 必须人工解除">强制熔断</button>
+                    </div>
+                    <button class="btn btn-success btn-sm w-full mt-2" @click="setStatus('RUNNING')">解除熔断</button>
+
+                    <div class="mt-3 text-xs text-gray-500 font-mono"
+                         style="word-break: break-all; max-height: 120px; overflow-y: auto;"
+                         x-show="opLog" x-text="opLog"></div>
+                </div>
+            </div>
+
+        </div>
+    </div>
+    <!-- ======== 模拟盘视图 END ======== -->
+
+    <!-- ======== 实盘视图 ======== -->
+    <div class="card" x-show="viewMode === 'real' && !canTrade" x-cloak>
+        <div class="card-header">
+            <div class="card-title">实盘不可用</div>
+        </div>
+        <div class="text-sm text-gray-700 leading-relaxed py-4">
+            当前工具是 <b>通达信</b>（<code>WUCAI_QMT=tdx</code>）。它只提供历史日线和财务，没有资金、持仓、下单接口。
+            <div class="mt-3">可以：回 <a href="/live/sim">模拟盘</a> 用日线跑策略；或把 <code>.env</code> 里的
+            <code>WUCAI_QMT</code> 改成 <code>qmt</code> / <code>miniqmt</code> 再开实盘。</div>
+        </div>
+    </div>
+
+    <div x-show="viewMode === 'real' && canTrade" x-cloak>
+        <!-- 顶部摘要条: QMT 连接状态 + 5 个 stat 卡片
+             已连接 -> 头部一行简洁信息 + stat 卡片
+             未连接 -> 头部一行 + 一段折叠说明 (默认折叠, 鼠标点开) -->
+        <div class="card mb-3" style="padding:12px 14px;">
+            <!-- 头部: 状态徽章 + 操作链接 -->
+            <div class="flex items-center gap-2 flex-wrap">
+                <span class="font-semibold text-sm">实盘账户 ({{ qmt_backend }})</span>
+                <span class="badge"
+                      :class="realAccount.connected ? 'badge-success' : 'badge-danger'"
+                      x-text="realAccount.connected ? '已连接' : '未连接'"></span>
+                <span class="badge badge-warning"
+                      x-show="realBookClosedEmpty()"
+                      x-text="(realAccount.market && realAccount.market.weekday) + ' 非交易日'"></span>
+
+                <!-- 已连接: 显示委托数 + 缓存秒数 -->
+                <template x-if="realAccount.connected">
+                    <span class="flex items-center gap-2 flex-wrap">
+                        <button type="button" class="text-xs text-indigo-600 hover:underline ml-1"
+                                @click="showRealOrders = true"
+                                x-text="'今日委托 ' + (realAccount.orders || []).length + (pendingRealOrders().length ? ' · 未结 ' + pendingRealOrders().length : '')"></button>
+                        <button type="button" class="text-xs text-indigo-600 hover:underline"
+                                @click="refreshRealAccount(true)">刷新</button>
+                        <span class="text-xs text-gray-400 font-mono"
+                              x-show="realUpdatedAt"
+                              x-text="realUpdatedAt + ' 更新'"></span>
+                    </span>
+                </template>
+
+                <!-- 未连接: 一个"为什么"按钮, 折叠详细说明 -->
+                <template x-if="!realAccount.connected">
+                    <span class="flex items-center gap-2">
+                        <button type="button" class="text-xs text-gray-600 hover:underline"
+                                @click="realHelpOpen = !realHelpOpen"
+                                x-text="realHelpOpen ? '▼ 收起说明' : '▶ 为什么没连上?'"></button>
+                        <button type="button" class="text-xs text-indigo-600 hover:underline"
+                                @click="refreshRealAccount(true)">重试连接</button>
+                    </span>
+                </template>
+            </div>
+
+            <!-- 未连接的详细说明: 默认折叠 -->
+            <template x-if="!realAccount.connected">
+                <div x-show="realHelpOpen" x-cloak x-transition
+                     class="text-xs text-gray-600 leading-relaxed mt-2 pl-1 border-l-2 border-gray-200 ml-1 pl-3">
+                    <ol class="list-decimal pl-4 space-y-0.5">
+                        <li>本机已登录 <b>QMT 极简版</b> 客户端</li>
+                        <li>在本项目根目录 <code>.env</code> 中配置 <code>QMT_PATH</code> 与 <code>ACCOUNT_ID</code> 后重启 app</li>
+                        <li>交易日 09:00 后才激活, 凌晨可能查询失败</li>
+                    </ol>
+                    <p class="text-xs text-gray-400 mt-1 break-all font-mono" x-show="realAccount.error"
+                       x-text="realAccount.error"></p>
+                </div>
+            </template>
+
+            <div class="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded px-3 py-2 mt-2 leading-relaxed"
+                 x-show="realBookClosedEmpty()">
+                今天是
+                <b x-text="realAccount.market && realAccount.market.weekday"></b>
+                ，不是交易日。QMT 资金和持仓经常查不到，下面空着不代表账户是 0。下个交易日登录交易后再看。
+            </div>
+
+            <!-- stat 卡片条: 5 个核心数字 -->
+            <template x-if="realAccount.connected">
+                <div class="grid grid-cols-2 md:grid-cols-5 gap-2 mt-1">
+                    <div class="rounded p-2 border bg-white">
+                        <div class="text-xs text-gray-500">总资产</div>
+                        <div class="num text-lg font-semibold leading-tight"
+                             x-text="realAssetText('total_asset')"></div>
+                    </div>
+                    <div class="rounded p-2 border bg-white">
+                        <div class="text-xs text-gray-500">可用现金</div>
+                        <div class="num text-lg font-semibold text-emerald-700 leading-tight"
+                             x-text="realAssetText('cash')"></div>
+                        <div class="text-xs text-gray-400" x-show="realAccount.asset.frozen_cash > 0"
+                             x-text="'冻结 ' + App.fmtNum(realAccount.asset.frozen_cash, 0)"></div>
+                    </div>
+                    <div class="rounded p-2 border bg-white">
+                        <div class="text-xs text-gray-500">市值 / 浮盈</div>
+                        <div class="num text-lg font-semibold text-indigo-700 leading-tight"
+                             x-text="realAssetText('market_value')"></div>
+                        <div class="text-xs num" x-show="realPosTotalPnl() !== null"
+                             :class="App.pnlClass(realPosTotalPnl())"
+                             x-text="App.fmtSign(realPosTotalPnl(), 0) + ' (' + App.fmtPct(realPosTotalPnlPct(), 2) + ')'"></div>
+                    </div>
+                    <div class="rounded p-2 border bg-white">
+                        <div class="text-xs text-gray-500">持仓 / 已绑策略</div>
+                        <div class="num text-lg font-semibold leading-tight"
+                             x-text="(realAccount.positions || []).length + ' 只'"></div>
+                        <div class="text-xs text-gray-400"
+                             x-text="'绑 ' + realStratCoverage().bound + ' / ' + realStratCoverage().total"></div>
+                    </div>
+                    <div class="rounded p-2 border"
+                         :class="approvalStats().pending > 0 ? 'bg-yellow-50 border-yellow-300' : 'bg-gray-50 border-gray-200'">
+                        <div class="text-xs"
+                             :class="approvalStats().pending > 0 ? 'text-yellow-700' : 'text-gray-500'">待授权</div>
+                        <div class="num font-bold leading-tight"
+                             :class="approvalStats().pending > 0 ? 'text-2xl text-yellow-700' : 'text-lg text-gray-400'"
+                             x-text="approvalStats().pending"></div>
+                        <div class="text-xs text-gray-500">
+                            已下单 <span class="text-green-700" x-text="approvalStats().approved"></span> ·
+                            过期 <span x-text="approvalStats().expired"></span>
+                        </div>
+                    </div>
+                </div>
+            </template>
+        </div>
+
+        <!-- 中段: 左 7/12 持仓 + 右 5/12 待授权 -->
+        <div class="grid grid-cols-1 md:grid-cols-12 gap-3">
+            <!-- 持仓表 -->
+            <div class="card md:col-span-7">
+                <div class="card-header">
+                    <div class="card-title">实盘持仓
+                        <span class="text-gray-400 font-normal text-xs"
+                              x-text="'(' + (realAccount.positions || []).length + ' 只)'"></span>
+                    </div>
+                    <span class="text-xs text-gray-400">点代码看 K 线 · 点策略可切换 / 解绑</span>
+                </div>
+
+                <template x-if="!realAccount.connected">
+                    <div class="text-gray-400 text-sm py-6 text-center">未连接 {{ qmt_backend }}</div>
+                </template>
+                <template x-if="realBookClosedEmpty()">
+                    <div class="text-gray-400 text-sm py-6 text-center">今天不是交易日，持仓暂查不到</div>
+                </template>
+                <template x-if="realAccount.connected && !realBookClosedEmpty() && (realAccount.positions || []).length === 0">
+                    <div class="text-gray-400 text-sm py-6 text-center">(账户暂无持仓)</div>
+                </template>
+                <template x-if="realAccount.connected && (realAccount.positions || []).length > 0">
+                    <div class="overflow-x-auto">
+                    <table class="app-table">
+                        <thead><tr>
+                            <th>股票</th>
+                            <th>策略</th>
+                            <th class="text-right">持仓</th>
+                            <th class="text-right">成本</th>
+                            <th class="text-right">现价</th>
+                            <th class="text-right">浮盈</th>
+                            <th class="text-right">%</th>
+                        </tr></thead>
+                        <tbody>
+                            <template x-for="p in realAccount.positions" :key="p.stock_code">
+                                <tr :title="'可用 ' + App.fmtNum(p.can_use_volume, 0)
+                                           + ' (T+1 限制)\n市值 ' + App.fmtNum(p.market_value, 0)">
+                                    <td>
+                                        <div class="stock-cell">
+                                            <button type="button" class="stock-kline-link stock-cell-btn"
+                                                    @click="openKlineModal(p.stock_code, { name: realPosName(p), cost: p.open_price })"
+                                                    :title="'查看 ' + realPosName(p) + ' (' + p.stock_code + ') 日 K 线'">
+                                                <span class="stock-cell-name"
+                                                      x-show="realPosName(p) !== p.stock_code"
+                                                      x-text="realPosName(p)"></span>
+                                                <span class="stock-cell-code" x-text="p.stock_code"></span>
+                                            </button>
+                                        </div>
+                                    </td>
+                                    <td>
+                                        <template x-if="hasBinding(p.stock_code)">
+                                            <button type="button" class="text-indigo-600 hover:underline text-xs text-left"
+                                                    @click="openPositionStrategyModal(p.stock_code)"
+                                                    :title="'策略 id: ' + resolvedExecStrategy(p.stock_code) + ' (点击查看 / 切换 / 解绑)'"
+                                                    x-text="resolvedExecStrategyLabel(p.stock_code)"></button>
+                                        </template>
+                                        <template x-if="!hasBinding(p.stock_code)">
+                                            <button type="button" class="text-xs text-left"
+                                                    style="color:#9ca3af;font-style:italic;"
+                                                    @click="openBindFromReal(p.stock_code)"
+                                                    title="未绑策略, 引擎不会对它出信号. 点击可绑定一个策略让 AI 给建议">
+                                                未绑 · 点击绑
+                                            </button>
+                                        </template>
+                                    </td>
+                                    <td class="text-right num" x-text="App.fmtNum(p.volume, 0)"></td>
+                                    <td class="text-right num" x-text="App.fmtNum(p.open_price, 2)"></td>
+                                    <td class="text-right num" x-text="realPosCurPrice(p) > 0 ? App.fmtNum(realPosCurPrice(p), 2) : '—'"></td>
+                                    <td class="text-right num" :class="App.pnlClass(realPosPnl(p))"
+                                        x-text="realPosPnl(p) === null ? '—' : App.fmtSign(realPosPnl(p), 0)"></td>
+                                    <td class="text-right num" :class="App.pnlClass(realPosPnlPct(p))"
+                                        x-text="realPosPnlPct(p) === null ? '—' : App.fmtPct(realPosPnlPct(p), 2)"></td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                    </div>
+                </template>
+            </div>
+
+            <!-- AI 信号 → 手动授权 下单 -->
+            <div class="card md:col-span-5">
+                <div class="card-header">
+                    <div>
+                        <div class="card-title">AI 信号 → 手动授权</div>
+                        <div class="card-subtitle">只收实盘持仓或实盘绑定的票; 点「授权」才走 {{ qmt_backend }} (5 分钟过期)</div>
+                    </div>
+                    <button class="btn btn-secondary btn-xs" @click="refreshApprovals(true)">刷新</button>
+                </div>
+
+                <!-- 待授权列表 -->
+                <template x-if="pendingApprovals().length === 0">
+                    <div class="text-gray-400 text-sm py-4 text-center border border-dashed border-gray-200 rounded">
+                        暂无待授权信号<br/>
+                        <span class="text-xs">模拟盘绑定的信号不会出现在这里</span>
+                    </div>
+                </template>
+                <div class="space-y-2">
+                    <template x-for="it in pendingApprovals()" :key="it.id">
+                        <div class="border rounded p-3"
+                             :class="it.side === 'buy' ? 'border-red-200 bg-red-50' : 'border-green-200 bg-green-50'">
+                            <div class="flex items-start justify-between gap-2 mb-2">
+                                <div class="flex-1 min-w-0">
+                                    <div class="flex items-center gap-2 flex-wrap">
+                                        <span class="badge"
+                                              :class="it.side === 'buy' ? 'badge-danger' : 'badge-success'"
+                                              x-text="it.side === 'buy' ? '买入' : '卖出'"></span>
+                                        <span class="text-sm font-bold" x-text="approvalName(it)"></span>
+                                        <code class="text-xs text-gray-500" x-text="it.code"></code>
+                                        <span class="text-xs text-gray-500" x-text="strategyLabel(it.strategy)"></span>
+                                    </div>
+                                    <div class="text-xs text-gray-600 mt-1">
+                                        建议 <b x-text="it.suggested_quantity + ' 股'"></b>
+                                        @ <span x-text="it.suggested_price > 0 ? it.suggested_price.toFixed(2) : '市价'"></span>
+                                        <span class="text-gray-400" x-show="it.reason"> · <span x-text="it.reason"></span></span>
+                                    </div>
+                                    <div class="text-xs text-gray-400 mt-1">
+                                        信号时间 <span x-text="it.ts"></span>
+                                        · <span x-text="Math.round(it.age_sec) + ' 秒前'"></span>
+                                        · 剩 <span x-text="Math.max(0, Math.round(300 - it.age_sec)) + ' 秒'"></span> 过期
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="flex gap-2">
+                                <button class="btn btn-success btn-xs flex-1"
+                                        @click="approveSignal(it)"
+                                        :disabled="approvalBusyId === it.id || it.eligible === false"
+                                        :title="it.eligible === false ? it.eligible_reason : '授权后真走 {{ qmt_backend }} 下单'"
+                                        x-text="approvalBusyId === it.id ? '下单中...'
+                                              : (it.eligible === false ? '不可下单' : '授权下单')"></button>
+                                <button class="btn btn-secondary btn-xs"
+                                        @click="rejectSignal(it)"
+                                        :disabled="approvalBusyId === it.id">拒绝</button>
+                            </div>
+                            <div class="text-xs text-red-700 mt-1" x-show="it.eligible === false"
+                                 x-text="'⚠ ' + it.eligible_reason"></div>
+                        </div>
+                    </template>
+                </div>
+
+                <!-- 已处理历史 (折叠) -->
+                <details class="mt-3" x-show="processedApprovals().length > 0">
+                    <summary class="cursor-pointer text-xs text-gray-600 select-none py-1">
+                        已处理 <span x-text="processedApprovals().length"></span> 条 (点开)
+                    </summary>
+                    <div class="space-y-1 mt-2">
+                        <template x-for="it in processedApprovals()" :key="it.id">
+                            <div class="text-xs flex items-center gap-2 py-1 border-b border-gray-100 last:border-0">
+                                <span class="badge"
+                                      :class="it.status === 'approved' ? 'badge-success'
+                                            : it.status === 'rejected' ? 'badge-secondary'
+                                            : 'badge-warning'"
+                                      x-text="it.status === 'approved' ? '已下单'
+                                            : it.status === 'rejected' ? '已拒绝' : '已过期'"></span>
+                                <span class="font-medium" x-text="approvalName(it)"></span>
+                                <code class="text-gray-400" x-text="it.code"></code>
+                                <span :class="it.side === 'buy' ? 'text-red-600' : 'text-green-600'"
+                                      x-text="it.side === 'buy' ? '买' : '卖'"></span>
+                                <span class="text-gray-500" x-text="it.suggested_quantity + ' 股'"></span>
+                                <span class="text-gray-400 ml-auto" x-text="it.processed_ts || it.ts"></span>
+                                <span class="text-red-600" x-show="it.error" x-text="it.error"></span>
+                                <span class="text-gray-500" x-show="it.order && it.order.order_id"
+                                      x-text="'#' + it.order.order_id"></span>
+                            </div>
+                        </template>
+                    </div>
+                </details>
+
+                <!-- 引导提示压缩成一行小字, 减少视觉噪音 -->
+                <div class="mt-2 text-xs text-gray-400 leading-relaxed">
+                    授权只收实盘持仓或实盘绑定; 模拟盘绑的票不会进待授权. 完整信号见下方「策略信号」。
+                </div>
+            </div>
+        </div>
+
+        <!-- 策略信号表 (引擎实时计算 = state.signals)
+             实盘视图也需要看引擎判断 -- 上面只放需要授权的 buy/sell;
+             这里展示所有最近策略信号(含历史回放), 用户能验证"为什么没出信号"和"信号已经被处理" -->
+        <div class="card">
+            <div class="card-header card-header-plain">
+                <div class="flex items-baseline gap-2 min-w-0">
+                    <div class="card-title">策略信号</div>
+                    <span class="text-gray-400" style="font-size:11px;font-weight:400;">方向变化才记一条，连续同向已合并</span>
+                </div>
+                <div class="flex items-center gap-2">
+                    <span class="text-xs text-gray-400"
+                          x-text="allSignals().length + ' 条'"></span>
+                    <button type="button" class="text-xs text-indigo-600 hover:underline"
+                            x-show="allSignals().length > 8"
+                            @click="signalBook.show = true">更多</button>
+                </div>
+            </div>
+            <template x-if="recentSignals().length === 0">
+                <div class="text-gray-400 text-sm py-3 text-center">(暂无信号 -- 等待盘中策略触发)</div>
+            </template>
+            <template x-if="recentSignals().length > 0">
+                <div class="overflow-x-auto">
+                <table class="app-table">
+                    <thead><tr>
+                        <th style="width:140px;">时间</th>
+                        <th style="width:120px;">股票</th>
+                        <th style="width:72px;">方向</th>
+                        <th style="width:160px;">策略</th>
+                        <th style="width:90px;">授权状态</th>
+                        <th>原因</th>
+                    </tr></thead>
+                    <tbody>
+                        <template x-for="(s, i) in recentSignals()" :key="i">
+                            <tr>
+                                <td class="num text-xs">
+                                    <span x-text="App.fmtSignalTs(s.ts)"></span>
+                                    <span x-show="s._dupCount > 1" class="text-gray-400"
+                                          :title="'同向连续 ' + s._dupCount + ' 次 (历史), 已合并'"
+                                          x-text="' ×' + s._dupCount"></span>
+                                </td>
+                                <td>
+                                    <button type="button" class="stock-kline-link stock-cell-btn"
+                                            @click="openKlineModal(s.code, { name: stockDisplayName(s.code) })"
+                                            :title="'查看 ' + stockDisplayName(s.code) + ' (' + s.code + ') 日 K 线'">
+                                        <span class="stock-cell-name"
+                                              x-show="stockDisplayName(s.code) !== s.code"
+                                              x-text="stockDisplayName(s.code)"></span>
+                                        <span class="stock-cell-code" x-text="s.code"></span>
+                                    </button>
+                                </td>
+                                <td>
+                                    <span class="badge"
+                                          :class="s.side === 'buy' ? 'badge-success' : 'badge-danger'"
+                                          x-text="s.side"></span>
+                                </td>
+                                <td>
+                                    <span class="text-xs text-gray-600"
+                                          :title="(s.reason || '') + ' (' + (s.strategy || '') + ')'"
+                                          x-text="strategyLabel(s.strategy) || '-'"></span>
+                                </td>
+                                <td>
+                                    <span class="text-xs"
+                                          :class="signalApprovalBadgeCls(s)"
+                                          x-text="signalApprovalText(s)"></span>
+                                </td>
+                                <td class="text-xs text-gray-600"
+                                    style="max-width:360px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
+                                    :title="s.reason || ''"
+                                    x-text="s.reason || '-'"></td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+                </div>
+            </template>
+            <p class="text-xs text-gray-400 mt-2 mb-0 leading-relaxed">
+                想看「资金曲线」? QMT 没提供历史净值 API, 实盘曲线无法回放; 模拟盘的曲线在
+                <a href="/live/sim" class="text-indigo-600 hover:underline">/live/sim</a> 「资金曲线」(基于 mock 持仓 + 同款策略, 仅作参考).
+            </p>
+        </div>
+
+    </div>
+    <!-- ======== 实盘视图 END ======== -->
+    <!-- 实盘持仓 已合并进上方"实盘账户"卡的 sub-section, 此处不再单独立卡 -->
+</div>
+
+<script>
+function liveApp() {
+    return {
+        showHelp: false,
+        showEmergency: false,   // 应急干预 默认折叠
+        showEvents: false,      // 事件流 默认折叠
+        realHelpOpen: false,    // /live/real "为什么没连上" 折叠提示
+        dragon: {               // 龙头战法面板 (CASE-C)
+            show: false, loading: false, binding: false,
+            // sourceMode: 'mysql' / 'xtdata'；versionMode: 'v1' / 'v2'
+            sourceMode: 'mysql',
+            versionMode: 'v2',
+            source: '', version: '', tradeDate: '', warning: '', items: [], loaded: false,
+        },
+        viewMode: '{{ view_mode|default("sim") }}',  // 由 /live/sim 或 /live/real URL 决定; engine 一直跑
+        canTrade: {{ can_trade | default(true) | tojson }},
+        isTdx: {{ is_tdx | default(false) | tojson }},
+        realAccount: {          // 实盘视图: 来自 QMT 的真实账户 (5 秒缓存, 后端 /api/live/real_account)
+            connected: false, error: null, asset: {}, positions: [], orders: [], cached_age_sec: -1,
+            market: null,
+        },
+        approvals: [],          // 实盘视图: AI 信号待授权列表 (后端 /api/live/approvals)
+        approvalBusyId: '',     // 正在处理的信号 id (用于按钮 disabled, 防重复点)
+        cancelBusyId: 0,        // 正在撤单的 order_id (按钮 disabled, 防重复)
+        showRealOrders: false,  // 实盘委托弹窗 (从「实盘账户」头部点开)
+        trialBusy: false,       // 「立即试算一轮」按钮 loading 态 (按钮已下线, 弹窗模板留作其他场景)
+        trialResult: null,      // 试算结果 {summary, diagnoses}, 非 null 时弹窗显示
+        chartMode: 'all',       // all (默认: 4-1 至今) / today (仅今天分时)
+        // (signalRange / orderRange today/all 切换已下线: 信号默认倒序展示 30 条, 订单 20 条)
+        showStratHelp: false,
+        state: {},
+        sim: { running: false, cycle_count: 0, last_cycle_at: null, last_error: null, dry_run: true },
+        simWatch: '',
+        simWatchDebounceTimer: null,
+        mergedList: [],
+        stockNames: {},   // {code: 中文名}, 来自 /api/live/watch_merge
+        bindingSource: {},  // {code: 'sim'|'real'}, 决定模拟盘「待入场」是否显示该 code
+        watchPoolText: '',
+        dryRun: true,
+        lastUpdate: '-',
+        realUpdatedAt: '',
+        opLog: '',
+        chart: null,
+
+        // ---- 资金面板 (派生自 state, 不查后端) ----
+        // capital = 初始本金, today_pnl = 持仓浮盈合计 (元), 所以 总资产 = 初始 + 浮盈
+        // 持仓市值 = positions[].market_value 之和; 现金 = 总资产 - 持仓市值
+        totalAssets() {
+            const cap = Number(this.state && this.state.capital) || 0;
+            const pnl = Number(this.state && this.state.today_pnl) || 0;
+            return cap + pnl;
+        },
+        holdingsValue() {
+            const ps = (this.state && this.state.positions) || [];
+            return ps.reduce((s, p) => s + (Number(p.market_value) || 0), 0);
+        },
+        cashAvailable() {
+            return Math.max(0, this.totalAssets() - this.holdingsValue());
+        },
+        holdingsRatio() {
+            const t = this.totalAssets();
+            return t > 0 ? this.holdingsValue() / t : 0;
+        },
+        cashRatio() {
+            const t = this.totalAssets();
+            return t > 0 ? this.cashAvailable() / t : 0;
+        },
+
+        slotCodes() {
+            return ((this.state.control || {}).slot_codes || []).map(String);
+        },
+        hasSlot(code) {
+            return this.slotCodes().includes(String(code));
+        },
+        heldCount() {
+            return this.displayPositions().filter(p => !p._zero).length;
+        },
+        pendingEntryCount() {
+            return this.displayPositions().filter(p => p._zero && this.hasSlot(p.code)).length;
+        },
+        watchOnlyCount() {
+            return this.displayPositions().filter(p => p._zero && !this.hasSlot(p.code)).length;
+        },
+        maxSlots() {
+            return Number((this.state.control || {}).max_slots);
+        },
+        slotAmount() {
+            const n = this.maxSlots();
+            if (n <= 0) return 0;
+            return (Number(this.state.capital) || 0) / n;
+        },
+        draftSlotAmount() {
+            const n = Number(this.posAlloc.draftSlots);
+            if (n <= 0) return 0;
+            return (Number(this.posAlloc.draftCapital) || 0) / n;
+        },
+        slotAmountText() {
+            return App.fmtNum(this.slotAmount(), 0);
+        },
+        unassignedCount() {
+            const slotted = new Set(this.slotCodes());
+            return this.displayPositions().filter(p => !slotted.has(p.code)).length;
+        },
+        allocRows() {
+            const slotted = new Set(this.slotCodes());
+            const target = this.draftSlotAmount();
+            return this.displayPositions().map(p => {
+                const vol = Number(p.volume) || 0;
+                const mv = Number(p.market_value) || 0;
+                const hasSlot = slotted.has(p.code);
+                const held = vol > 0;
+                let note = '只监控';
+                if (hasSlot && held && mv > target) note = '涨过目标，等策略卖';
+                else if (hasSlot && held) note = '持仓';
+                else if (hasSlot) note = '空仓，档还在';
+                return {
+                    code: p.code,
+                    name: p.name || this.stockDisplayName(p.code),
+                    slotted: hasSlot,
+                    held,
+                    target,
+                    mv,
+                    note,
+                };
+            });
+        },
+        openPosAlloc() {
+            this.posAlloc.draftCapital = Number(this.state.capital) || 0;
+            this.posAlloc.draftSlots = this.maxSlots();
+            this.posAlloc.show = true;
+        },
+        async saveMaxSlots() {
+            const r = await App.post('/api/live/slots', {
+                capital: this.posAlloc.draftCapital,
+                max_slots: this.posAlloc.draftSlots,
+            });
+            this.opLog = (r && r.message) || '';
+            if (r && r.ok) {
+                App.toast(r.message, 'success');
+                await this.refresh();
+            } else {
+                App.toast((r && r.message) || '保存失败', 'danger');
+            }
+        },
+        async assignSlot(code) {
+            const r = await App.post('/api/live/slots', { assign: code });
+            this.opLog = (r && r.message) || '';
+            App.toast((r && r.message) || '分档失败', r && r.ok ? 'success' : 'danger');
+            if (r && r.ok) await this.refresh();
+        },
+        async releaseSlot(code) {
+            const r = await App.post('/api/live/slots', { release: code });
+            this.opLog = (r && r.message) || '';
+            App.toast((r && r.message) || '释放失败', r && r.ok ? 'success' : 'danger');
+            if (r && r.ok) await this.refresh();
+        },
+
+        // ---- 策略路由 ----
+        strategyGroups: [],     // [{name: '技术指标', items: [{name, label, description}, ...]}, ...]
+        strategyFlat: [],       // [{name, label, group, description}, ...] (供 <select> 用)
+        strategiesLoadError: '', // API 失败时显示, 避免一直「加载中」
+        strategyConfig: { default: 'macd_1d', per_stock: {} },
+        // 持仓表「执行策略」点击后弹窗
+        strategyDetailForPos: {
+            show: false,
+            code: '',
+            label: '',
+            scenario: '',
+            rules: '',
+            example: '',
+            desc: '',
+            switchTo: '',
+        },
+        // 添加股票并绑定策略; source 决定写到模拟盘自选池还是实盘绑定 (默认 sim)
+        stockBind: {
+            show: false,
+            code: '',
+            strategy: '',
+            source: 'sim',
+            suggests: [],
+            searchTimer: null,
+        },
+        posAlloc: {
+            show: false,
+            draftCapital: 1000000,
+            draftSlots: 5,
+        },
+        resetBook: {
+            show: false,
+            busy: false,
+            startDate: '2026-04-01',
+            draftCapital: 1000000,
+            draftSlots: 5,
+            rows: [],
+        },
+        orderBook: { show: false },
+        signalBook: { show: false },
+
+        // 日 K 弹窗 (点代码 / 名称)
+        klineModal: {
+            show: false,
+            loading: false,
+            error: '',
+            code: '',
+            name: '',
+            count: 120,
+            cost: 0,
+            bars: [],
+            stats: null,
+        },
+
+        openStockBind() {
+            // 勿整体替换 stockBind，否则弹窗内 select 的 x-model 可能丢绑定，确定时 strategy 为空导致绑定失败
+            this.stockBind.show = true;
+            this.stockBind.code = '';
+            this.stockBind.strategy = '';
+            this.stockBind.source = 'sim';
+            this.stockBind.suggests = [];
+        },
+
+        stockLabel(code, name) {
+            const c = (code || '').trim();
+            const n = (name || '').trim();
+            if (n && c && n !== c) return n + '(' + c + ')';
+            return c || n;
+        },
+
+        /** 输入框可能是「兆易创新(603986.SH)」, 提交前拆出代码 */
+        extractStockCode(raw) {
+            const s = (raw || '').trim();
+            const m = s.match(/[\(（]([0-9]{6}\.(?:SH|SZ|BJ))[\)）]\s*$/i);
+            if (m) return m[1].toUpperCase();
+            return s;
+        },
+
+        onStockBindQueryInput() {
+            const q = (this.stockBind.code || '').trim();
+            clearTimeout(this.stockBind.searchTimer);
+            if (q.length < 1) {
+                this.stockBind.suggests = [];
+                return;
+            }
+            if (/\([0-9]{6}\.(SH|SZ|BJ)\)$/i.test(q)) {
+                this.stockBind.suggests = [];
+                return;
+            }
+            this.stockBind.searchTimer = setTimeout(() => this.searchStockSuggests(q), 220);
+        },
+
+        async searchStockSuggests(q) {
+            try {
+                const res = await App.get('/api/live/stock/search?q=' + encodeURIComponent(q) + '&limit=12');
+                // 输入已变则丢弃过期结果
+                if ((this.stockBind.code || '').trim() !== q) return;
+                this.stockBind.suggests = Array.isArray(res.items) ? res.items : [];
+            } catch (e) {
+                console.error('searchStockSuggests', e);
+                this.stockBind.suggests = [];
+            }
+        },
+
+        pickStockSuggest(item) {
+            if (!item || !item.code) return;
+            this.stockBind.code = this.stockLabel(item.code, item.name);
+            this.stockBind.suggests = [];
+        },
+
+        async confirmStockBind() {
+            const code = this.extractStockCode(this.stockBind.code);
+            const strategy = (this.stockBind.strategy || '').trim();
+            const source = (this.stockBind.source === 'real') ? 'real' : 'sim';
+            if (!code) {
+                App.toast('请填写股票代码或名称', 'warn');
+                return;
+            }
+            if (!strategy) {
+                App.toast('请选择策略', 'warn');
+                return;
+            }
+            try {
+                const r = await App.post('/api/live/stock/bind', { code, strategy, source });
+                if (r && typeof r === 'object' && r.ok) {
+                    this.opLog = r.message || '';
+                    App.toast(r.message || '已绑定', 'success');
+                    this.stockBind.show = false;
+                    this.stockBind.suggests = [];
+                    if (r.per_stock && typeof r.per_stock === 'object') {
+                        this.strategyConfig.per_stock = { ...r.per_stock };
+                    }
+                    if (r.default) this.strategyConfig.default = r.default;
+                    await this.loadWatchPool();
+                    await this.refreshMergedWatch();
+                } else {
+                    // 多候选时把列表铺到下拉, 方便点选
+                    if (r && Array.isArray(r.candidates) && r.candidates.length) {
+                        this.stockBind.suggests = r.candidates;
+                    }
+                    let detail = (r && typeof r === 'object' && r.message)
+                        ? r.message
+                        : (typeof r === 'string' ? r : JSON.stringify(r || {}));
+                    const ds = String(detail);
+                    if (ds === 'Not Found' || /^HTTP 404/i.test(ds)) {
+                        detail = '接口 404：当前后端可能未加载 stock/bind。请重启 python app.py，并访问 ' + window.location.origin + '/api/live/ping 应看到 ok:true';
+                    }
+                    App.toast('绑定失败: ' + detail, 'danger');
+                }
+            } catch (e) {
+                console.error(e);
+                App.toast('请求失败: ' + (e && e.message ? e.message : String(e)), 'warn');
+            }
+        },
+
+        async init() {
+            await this.loadStrategies();
+            await this.loadWatchPool();
+            await this.refreshMergedWatch();
+            await this.refresh();
+            // 5 秒自动轮询
+            setInterval(() => this.refresh(), 5000);
+        },
+
+        async refresh() {
+            try {
+                this.state = await App.get('/api/live/state');
+                this.sim   = await App.get('/api/live/sim/status');
+                // 信号/订单表用中文名: 合并 state.names
+                if (this.state && this.state.names && typeof this.state.names === 'object') {
+                    this.stockNames = { ...(this.stockNames || {}), ...this.state.names };
+                }
+                this.lastUpdate = new Date().toLocaleTimeString('zh-CN');
+                this.renderChart();
+                try { await this.refreshStrategyConfig(); } catch (e) { console.error('refreshStrategyConfig', e); }
+                await this.refreshMergedWatch();
+                // 仅当用户处在「实盘」视图时才轮询 QMT + 待授权信号
+                if (this.viewMode === 'real') {
+                    await this.refreshRealAccount();
+                    await this.refreshApprovals();
+                }
+            } catch (e) {
+                console.error(e);
+            }
+        },
+
+        /** 代码 -> 中文名; 没有名称时回落为代码本身 */
+        stockDisplayName(code) {
+            if (!code) return '';
+            const n = (this.stockNames || {})[code];
+            if (n && n !== code) return n;
+            const pos = (this.state.positions || []).find(p => p.code === code);
+            if (pos && pos.name && pos.name !== code) return pos.name;
+            return code;
+        },
+
+        // 已连接但资金/持仓都空, 且今天不是交易日: 不当成真的 0
+        realBookClosedEmpty() {
+            const m = this.realAccount.market;
+            if (!m || m.is_trading_day) return false;
+            if (!this.realAccount.connected) return false;
+            const a = this.realAccount.asset || {};
+            const total = Number(a.total_asset);
+            const emptyMoney = !(total > 0);
+            const emptyPos = (this.realAccount.positions || []).length === 0;
+            return emptyMoney && emptyPos;
+        },
+        realAssetText(field) {
+            if (this.realBookClosedEmpty()) return '—';
+            const a = this.realAccount.asset || {};
+            return App.fmtNum(a[field], 0);
+        },
+        /** 拉 QMT 真实账户 + 持仓 (后端 5 秒缓存, 频繁调用安全)
+         *  force=true 时仍走同一接口, 后端缓存到期后会重连查询 */
+        async refreshRealAccount(force) {
+            try {
+                const r = await App.get('/api/live/real_account');
+                if (r && typeof r === 'object') {
+                    this.realAccount = {
+                        connected: !!r.connected,
+                        error:     r.error || null,
+                        asset:     r.asset || {},
+                        positions: Array.isArray(r.positions) ? r.positions : [],
+                        orders:    Array.isArray(r.orders) ? r.orders : [],
+                        cached_age_sec: typeof r.cached_age_sec === 'number' ? r.cached_age_sec : -1,
+                        market:    r.market || null,
+                    };
+                    const nameMap = {};
+                    (this.realAccount.positions || []).forEach(p => {
+                        if (p && p.stock_code && p.name && p.name !== p.stock_code) {
+                            nameMap[p.stock_code] = p.name;
+                        }
+                    });
+                    if (Object.keys(nameMap).length) {
+                        this.stockNames = { ...(this.stockNames || {}), ...nameMap };
+                    }
+                    this.realUpdatedAt = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+                    if (force) {
+                        App.toast(r.connected ? '{{ qmt_backend }} 数据已刷新' : ('{{ qmt_backend }} 未连接: ' + (r.error || '未知')),
+                                  r.connected ? 'success' : 'warn');
+                    }
+                }
+            } catch (e) {
+                console.error('refreshRealAccount', e);
+                this.realAccount.connected = false;
+                this.realAccount.error = String(e && e.message || e);
+            }
+        },
+
+        /** 拉 AI 信号待授权列表 (实盘视图专用); 后端汇总最近 30 条 buy/sell 信号 + approval 状态 */
+        async refreshApprovals(toastOnDone) {
+            try {
+                const r = await App.get('/api/live/approvals');
+                this.approvals = (r && Array.isArray(r.items)) ? r.items : [];
+                const nameMap = {};
+                (this.approvals || []).forEach(it => {
+                    if (it && it.code && it.name && it.name !== it.code) nameMap[it.code] = it.name;
+                });
+                if (Object.keys(nameMap).length) {
+                    this.stockNames = { ...(this.stockNames || {}), ...nameMap };
+                }
+                if (toastOnDone) App.toast('已刷新 ' + this.approvals.length + ' 条信号', 'info');
+            } catch (e) {
+                console.error('refreshApprovals', e);
+                if (toastOnDone) App.toast('刷新失败: ' + (e && e.message ? e.message : e), 'warn');
+            }
+        },
+
+        pendingApprovals() {
+            return (this.approvals || []).filter(it => it.status === 'pending');
+        },
+        processedApprovals() {
+            return (this.approvals || []).filter(it => it.status !== 'pending');
+        },
+        approvalStats() {
+            const s = { pending: 0, approved: 0, rejected: 0, expired: 0 };
+            (this.approvals || []).forEach(it => { if (s[it.status] !== undefined) s[it.status] += 1; });
+            return s;
+        },
+
+        async approveSignal(it) {
+            if (!it || !it.id) return;
+            const tip = '确认走 {{ qmt_backend }} 真实下单?\n\n'
+                      + (it.side === 'buy' ? '买入' : '卖出') + ' '
+                      + this.approvalName(it) + ' ' + it.code + ' '
+                      + it.suggested_quantity + ' 股 @ '
+                      + (it.suggested_price > 0 ? it.suggested_price.toFixed(2) : '市价');
+            if (!window.confirm(tip)) return;
+            this.approvalBusyId = it.id;
+            try {
+                const r = await App.post('/api/live/approvals/approve', { id: it.id });
+                App.toast(r.message || (r.ok ? '已下单' : '下单失败'), r.ok ? 'success' : 'danger');
+                await this.refreshApprovals();
+                if (r.ok) await this.refreshRealAccount(false);
+            } catch (e) {
+                App.toast('请求失败: ' + (e && e.message ? e.message : e), 'danger');
+            } finally {
+                this.approvalBusyId = '';
+            }
+        },
+
+        async rejectSignal(it) {
+            if (!it || !it.id) return;
+            this.approvalBusyId = it.id;
+            try {
+                const r = await App.post('/api/live/approvals/reject', { id: it.id });
+                App.toast(r.message || '已拒绝', r.ok ? 'info' : 'warn');
+                await this.refreshApprovals();
+            } catch (e) {
+                App.toast('请求失败: ' + (e && e.message ? e.message : e), 'danger');
+            } finally {
+                this.approvalBusyId = '';
+            }
+        },
+
+        /** 拿策略中文标签 (用 strategyFlat 已加载好的; 没找到就回原 name) */
+        strategyLabel(name) {
+            if (!name) return '';
+            const hit = (this.strategyFlat || []).find(s => s.name === name);
+            return hit ? hit.label : name;
+        },
+
+        /** 从服务端读自选池到文本框 (仅 init 调用, 避免覆盖用户未保存编辑) */
+        async loadWatchPool() {
+            try {
+                const d = await App.get('/api/live/watch_pool');
+                const arr = d && Array.isArray(d.codes) ? d.codes : [];
+                this.watchPoolText = arr.join(',');
+            } catch (e) {
+                console.error('loadWatchPool', e);
+            }
+        },
+
+        async saveWatchPool() {
+            const raw = (this.watchPoolText || '').replace(/\r?\n/g, ',').replace(/，/g, ',');
+            try {
+                const r = await App.post('/api/live/watch_pool', { codes: raw });
+                if (!r || typeof r !== 'object') {
+                    App.toast('保存失败: 服务返回异常', 'warn');
+                    return;
+                }
+                this.opLog = r.message || '';
+                App.toast(r.ok ? (r.message || '已保存') : (r.message || '保存失败'), r.ok ? 'success' : 'warn');
+                if (r.ok) await this.refreshMergedWatch();
+            } catch (e) {
+                console.error(e);
+                App.toast('保存失败: ' + (e && e.message ? e.message : String(e)), 'warn');
+            }
+        },
+
+        /** 与后端 merge_watch_codes 一致: 额外监控 + 持仓 + 自选 + 路由键 */
+        async refreshMergedWatch() {
+            try {
+                const ui = encodeURIComponent(this.simWatch || '');
+                const res = await App.get('/api/live/watch_merge?ui=' + ui);
+                this.mergedList = Array.isArray(res.merged) ? res.merged : [];
+                this.bindingSource = (res && res.binding_source) ? res.binding_source : {};
+                // 合并而非覆盖: 保留 state 里信号/订单已解析的名称
+                if (res && res.names && typeof res.names === 'object') {
+                    this.stockNames = { ...(this.stockNames || {}), ...res.names };
+                }
+            } catch (e) {
+                console.error('refreshMergedWatch', e);
+                this.mergedList = [];
+                this.bindingSource = {};
+            }
+        },
+
+        /** 临时代码输入防抖, 减少手动点「刷新列表」 */
+        onSimWatchDebounced() {
+            clearTimeout(this.simWatchDebounceTimer);
+            this.simWatchDebounceTimer = setTimeout(() => {
+                this.refreshMergedWatch();
+            }, 450);
+        },
+
+        async refreshStrategyConfig() {
+            const cfg = await App.get('/api/live/strategies/config');
+            if (!cfg || typeof cfg !== 'object') return null;
+            this.strategyConfig = {
+                default:   cfg.default || 'macd_1d',
+                per_stock: cfg.per_stock || {},
+            };
+            if (cfg.dragon_version === 'v1' || cfg.dragon_version === 'v2') {
+                this.dragon.versionMode = cfg.dragon_version;
+            }
+            return cfg;
+        },
+
+        async loadStrategies() {
+            this.strategiesLoadError = '';
+            try {
+                const reg = await App.get('/api/live/strategies/registry');
+                if (!reg || typeof reg !== 'object' || !Array.isArray(reg.flat)) {
+                    this.strategiesLoadError = '策略接口返回异常 (请确认已重启到新版 app, 且访问端口与后端一致)';
+                    return;
+                }
+                // 把 {group: [items]} 转成数组, 保持原始注册顺序
+                this.strategyGroups = Object.entries(reg.groups || {}).map(
+                    ([name, items]) => ({ name, items })
+                );
+                this.strategyFlat = reg.flat;
+                const cfg = await this.refreshStrategyConfig();
+                if (!cfg) {
+                    this.strategiesLoadError = '路由配置接口返回异常';
+                    return;
+                }
+            } catch (e) {
+                console.error('loadStrategies failed', e);
+                this.strategiesLoadError = '加载策略失败: ' + (e && e.message ? e.message : String(e))
+                    + ' (检查网络与 /api/live/strategies/registry 是否可访问)';
+            }
+        },
+
+        watchCodes() {
+            return (this.simWatch || '')
+                .split(',')
+                .map(c => c.trim())
+                .filter(c => c.length > 0);
+        },
+
+        /** 当前路由下该代码对应的策略 id (per_stock 优先, 否则 default) */
+        resolvedExecStrategy(code) {
+            const ps = this.strategyConfig.per_stock || {};
+            return ps[code] || this.strategyConfig.default || 'macd_1d';
+        },
+
+        /** 持仓表「执行策略」列: 显示中文 label */
+        resolvedExecStrategyLabel(code) {
+            const name = this.resolvedExecStrategy(code);
+            const m = (this.strategyFlat || []).find(s => s.name === name);
+            return m ? m.label : name;
+        },
+
+        /** 打开日 K 弹窗: 持仓代码 / 名称 / 信号代码 共用 */
+        async openKlineModal(code, opts) {
+            const c = (code || '').trim();
+            if (!c) return;
+            opts = opts || {};
+            this.klineModal.show = true;
+            this.klineModal.code = c;
+            this.klineModal.name = opts.name || c;
+            this.klineModal.cost = Number(opts.cost) || 0;
+            this.klineModal.error = '';
+            this.klineModal.stats = null;
+            this.klineModal.bars = [];
+            this._lockPageScroll();
+            await this.loadKlineData();
+        },
+
+        closeKlineModal() {
+            this.klineModal.show = false;
+            this._unlockPageScroll();
+            const el = document.getElementById('live-kline-chart');
+            if (el && window.Plotly) {
+                try { Plotly.purge(el); } catch (e) { /* ignore */ }
+            }
+        },
+
+        /** 弹窗打开时锁背景滚动, 避免滚轮带动背后页面 */
+        _lockPageScroll() {
+            if (this._pageScrollLocked) return;
+            this._pageScrollLocked = true;
+            this._savedScrollY = window.scrollY || 0;
+            document.documentElement.classList.add('modal-open');
+            document.body.classList.add('modal-open');
+            document.body.style.top = '-' + this._savedScrollY + 'px';
+        },
+        _unlockPageScroll() {
+            if (!this._pageScrollLocked) return;
+            this._pageScrollLocked = false;
+            document.documentElement.classList.remove('modal-open');
+            document.body.classList.remove('modal-open');
+            document.body.style.top = '';
+            window.scrollTo(0, this._savedScrollY || 0);
+        },
+
+        async setKlinePeriod(n) {
+            if (this.klineModal.count === n && this.klineModal.bars.length) return;
+            this.klineModal.count = n;
+            await this.loadKlineData();
+        },
+
+        async loadKlineData() {
+            const code = this.klineModal.code;
+            if (!code) return;
+            this.klineModal.loading = true;
+            this.klineModal.error = '';
+            try {
+                const r = await App.get(
+                    '/api/live/kline?code=' + encodeURIComponent(code)
+                    + '&count=' + this.klineModal.count
+                );
+                if (!r || !r.ok) {
+                    this.klineModal.error = (r && r.message) || '加载失败';
+                    this.klineModal.bars = [];
+                    this.klineModal.stats = null;
+                    return;
+                }
+                this.klineModal.code = r.code || code;
+                this.klineModal.name = r.name || this.klineModal.name || code;
+                this.klineModal.bars = r.bars || [];
+                this.klineModal.stats = r.stats || null;
+                await this.$nextTick();
+                this.renderKlineChart();
+            } catch (e) {
+                this.klineModal.error = '请求异常: ' + (e.message || e);
+            } finally {
+                this.klineModal.loading = false;
+                await this.$nextTick();
+                if (!this.klineModal.error && this.klineModal.bars.length) {
+                    this.renderKlineChart();
+                }
+            }
+        },
+
+        tradesForCode(code) {
+            const c = (code || '').trim();
+            return (this.state.orders || [])
+                .filter(o => o && o.code === c && (o.side === 'buy' || o.side === 'sell'))
+                .map(o => ({
+                    date: String(o.ts || '').slice(0, 10),
+                    side: o.side,
+                    price: Number(o.price) || 0,
+                    quantity: Number(o.quantity) || 0,
+                    strategy: o.strategy || '',
+                }))
+                .filter(t => t.date && t.price > 0);
+        },
+
+        renderKlineChart() {
+            // 与回测页共用 App.renderStockKline; 买卖点来自 4-1 以来的成交
+            App.renderStockKline('live-kline-chart', {
+                bars: this.klineModal.bars || [],
+                cost: this.klineModal.cost || 0,
+                trades: this.tradesForCode(this.klineModal.code),
+            });
+        },
+
+        openPositionStrategyModal(code) {
+            const name = this.resolvedExecStrategy(code);
+            const meta = (this.strategyFlat || []).find(s => s.name === name);
+            // 整体替换 strategyDetailForPos 是 OK 的: 内层 select x-model="strategyDetailForPos.switchTo"
+            // 走属性访问, Alpine 在 modal 显示瞬间会重新求值, 不存在 stockBind 那种 select 跑空的问题.
+            this.strategyDetailForPos = {
+                show: true,
+                code: code || '',
+                label: meta ? meta.label : name,
+                scenario: meta && meta.scenario ? meta.scenario : '',
+                rules: meta && meta.rules ? meta.rules : '',
+                example: meta && meta.example ? meta.example : '',
+                desc: meta ? meta.description : '（暂无说明, 请检查策略是否已加载）',
+                switchTo: name,
+            };
+        },
+
+        /** 弹窗里点「保存」:
+         *  - target 为空 -> 走 /stock/unbind 解绑 (从 per_stock + watch_pool 移除)
+         *  - target 非空 -> 改 per_stock[code], 调 /strategies/config 热加载
+         */
+        async confirmSwitchStrategy() {
+            const code = (this.strategyDetailForPos.code || '').trim();
+            const target = (this.strategyDetailForPos.switchTo || '').trim();
+            if (!code) return;
+            if (!target) {
+                await this.confirmUnbindStrategy();
+                return;
+            }
+            const ps = { ...(this.strategyConfig.per_stock || {}) };
+            ps[code] = target;
+            const payload = { default: this.strategyConfig.default, per_stock: ps };
+            try {
+                const r = await App.post('/api/live/strategies/config', payload);
+                if (r && r.ok) {
+                    this.strategyConfig.per_stock = ps;
+                    this.opLog = r.message || '';
+                    App.toast(code + ' 已切换为: ' + (this.resolvedExecStrategyLabel(code)), 'success');
+                    this.strategyDetailForPos.show = false;
+                } else {
+                    App.toast('切换失败: ' + ((r && r.message) || '未知错误'), 'danger');
+                }
+            } catch (e) {
+                console.error(e);
+                App.toast('请求失败: ' + (e && e.message ? e.message : String(e)), 'danger');
+            }
+        },
+
+        simUpdatedAt() {
+            const raw = ((this.sim && this.sim.last_cycle_at) || this.lastUpdate || '').trim();
+            if (!raw || raw === '-') return '';
+            const m = raw.match(/\d{1,2}:\d{2}:\d{2}/);
+            return m ? m[0] : raw;
+        },
+        approvalName(it) {
+            const code = (it && it.code) || '';
+            if (it && it.name && it.name !== code) return it.name;
+            return this.stockDisplayName(code) || code;
+        },
+        realPosName(p) {
+            const code = (p && p.stock_code) || '';
+            if (p && p.name && p.name !== code) return p.name;
+            return this.stockDisplayName(code) || code;
+        },
+        /** 现价优先 QMT tick.lastPrice; 没有再用市值 / 持仓反算 */
+        realPosCurPrice(p) {
+            const last = Number(p && p.last_price) || 0;
+            if (last > 0) return last;
+            const v = Number(p && p.volume) || 0;
+            const mv = Number(p && p.market_value) || 0;
+            if (v <= 0 || mv <= 0) return 0;
+            return mv / v;
+        },
+        /** 浮盈 = (现价 - 成本) * 持仓; 算不出返回 null */
+        realPosPnl(p) {
+            const cur = this.realPosCurPrice(p);
+            const cost = Number(p && p.open_price) || 0;
+            const v = Number(p && p.volume) || 0;
+            if (cur <= 0 || cost <= 0 || v <= 0) return null;
+            return (cur - cost) * v;
+        },
+        /** 盈亏% = (现价 - 成本) / 成本; 返回小数 (0.05 = 5%), 前端 App.fmtPct 内部会 *100 */
+        realPosPnlPct(p) {
+            const cur = this.realPosCurPrice(p);
+            const cost = Number(p && p.open_price) || 0;
+            if (cur <= 0 || cost <= 0) return null;
+            return (cur - cost) / cost;
+        },
+        /** 未结委托 (可撤单) -- 用于卡片标题统计 */
+        pendingRealOrders() {
+            return (this.realAccount.orders || []).filter(o => o && o.cancelable);
+        },
+
+        /** 实盘账户总浮盈 (元) = 各持仓 realPosPnl 之和; 任意一只算不出就跳过该只
+         *  全部持仓都算不出 (eg 缺现价) -> 返回 null, 前端显示"待 QMT 推送现价" */
+        realPosTotalPnl() {
+            const ps = (this.realAccount.positions || []);
+            let sum = 0, valid = 0;
+            ps.forEach(p => {
+                const v = this.realPosPnl(p);
+                if (v !== null) { sum += v; valid += 1; }
+            });
+            return valid > 0 ? sum : null;
+        },
+        /** 总浮盈% = 总浮盈 / 总成本 (sum(volume*open_price))
+         *  返回小数 (0.05 = 5%), App.fmtPct 内部会 *100 -- 不要在这里再乘 */
+        realPosTotalPnlPct() {
+            const ps = (this.realAccount.positions || []);
+            let costSum = 0, pnlSum = 0, valid = 0;
+            ps.forEach(p => {
+                const cost = Number(p.open_price) || 0;
+                const vol = Number(p.volume) || 0;
+                const pnl = this.realPosPnl(p);
+                if (pnl !== null && cost > 0 && vol > 0) {
+                    costSum += cost * vol;
+                    pnlSum += pnl;
+                    valid += 1;
+                }
+            });
+            if (valid === 0 || costSum <= 0) return null;
+            return pnlSum / costSum;
+        },
+        /** 实盘持仓策略覆盖率 {bound, total}; bound = 当前持仓里在 strategy_config 里有绑的 */
+        realStratCoverage() {
+            const ps = (this.realAccount.positions || []);
+            const total = ps.length;
+            let bound = 0;
+            ps.forEach(p => { if (this.hasBinding(p.stock_code)) bound += 1; });
+            return { bound, total };
+        },
+        /** 今日已成交委托 (traded_volume > 0); 用于状态条统计 */
+        realFilledOrders() {
+            return (this.realAccount.orders || []).filter(o => Number(o && o.traded_volume) > 0);
+        },
+
+        /** 「策略信号」表的"授权状态"列文案: 用 _signal_id 和 approvals 联表
+         *  signal id = ts|code|side, approvals 由 /api/live/approvals 维护 */
+        _signalKey(s) {
+            return (s.ts || '') + '|' + (s.code || '') + '|' + (s.side || '');
+        },
+        signalApprovalText(s) {
+            const k = this._signalKey(s);
+            const hit = (this.approvals || []).find(a => a.id === k);
+            if (!hit) return '—';
+            return hit.status === 'pending'  ? '待授权'
+                 : hit.status === 'approved' ? '已下单'
+                 : hit.status === 'rejected' ? '已拒绝'
+                 : hit.status === 'expired'  ? '已过期'
+                 : hit.status;
+        },
+        signalApprovalBadgeCls(s) {
+            const k = this._signalKey(s);
+            const hit = (this.approvals || []).find(a => a.id === k);
+            if (!hit) return 'text-gray-400';
+            return hit.status === 'pending'  ? 'text-yellow-700 font-semibold'
+                 : hit.status === 'approved' ? 'text-green-700 font-semibold'
+                 : hit.status === 'rejected' ? 'text-gray-600'
+                 : 'text-gray-400';
+        },
+
+        /** 撤单: 调 /real_order/cancel, 成功后立刻刷新一次 (后端会让 cache 过期) */
+        async cancelRealOrder(o) {
+            if (!o || !o.order_id) return;
+            if (!window.confirm('确认撤销委托 #' + o.order_id + ' (' + o.stock_code + ' '
+                                + (o.side === 'buy' ? '买入' : '卖出') + ' '
+                                + o.order_volume + '股) ?')) return;
+            this.cancelBusyId = o.order_id;
+            try {
+                const r = await App.post('/api/live/real_order/cancel', { order_id: o.order_id });
+                App.toast(r.message || (r.ok ? '撤单已提交' : '撤单失败'), r.ok ? 'success' : 'danger');
+                if (r.ok) await this.refreshRealAccount(false);
+            } catch (e) {
+                App.toast('请求失败: ' + (e && e.message ? e.message : e), 'danger');
+            } finally {
+                this.cancelBusyId = 0;
+            }
+        },
+
+        /** 实盘表里某只「未绑定」的票, 点击 → 复用「添加股票」弹窗 (code 预填好) */
+        openBindFromReal(code) {
+            this.stockBind.show = true;
+            this.stockBind.code = this.stockLabel(code, this.stockDisplayName(code));
+            this.stockBind.strategy = '';
+            this.stockBind.source = 'real';   // 实盘绑定: 不污染模拟盘的「待入场」
+            this.stockBind.suggests = [];
+        },
+
+        /** 该 code 是否有显式策略绑定 (per_stock 里有 / 或在 watch_pool 里); 决定弹窗是否显示「解除绑定」 */
+        hasBinding(code) {
+            if (!code) return false;
+            const ps = this.strategyConfig.per_stock || {};
+            if (ps[code]) return true;
+            return (this.mergedList || []).includes(code);
+        },
+
+        /** 弹窗里点「解除绑定」: 调 /stock/unbind 移除 per_stock + watch_pool, 引擎热加载后不再出信号 */
+        async confirmUnbindStrategy() {
+            const code = (this.strategyDetailForPos.code || '').trim();
+            if (!code) return;
+            if (!window.confirm(
+                code + ' 解除绑定后, 引擎不再对它算 buy/sell 信号.\n\n确定?'
+            )) return;
+            try {
+                const r = await App.post('/api/live/stock/unbind', { code });
+                if (r && r.ok) {
+                    if (r.per_stock) this.strategyConfig.per_stock = r.per_stock;
+                    if (r.default) this.strategyConfig.default = r.default;
+                    await this.refreshMergedWatch();
+                    this.opLog = r.message || '';
+                    App.toast(r.message || (code + ' 已解绑'), 'success');
+                    this.strategyDetailForPos.show = false;
+                } else {
+                    App.toast('解绑失败: ' + ((r && r.message) || '未知错误'), 'danger');
+                }
+            } catch (e) {
+                console.error(e);
+                App.toast('请求失败: ' + (e && e.message ? e.message : String(e)), 'danger');
+            }
+        },
+
+        /** 持仓表 + 监控池里没成交的票 (volume = 0) 合并; 让用户加完即看到"已纳入交易" */
+        zeroPositionRows() {
+            // 模拟盘的「待入场」: 监控池 - 已持仓代码 - 仅在「实盘」绑定的代码 (source=real)
+            // 这样实盘里加股票不会污染模拟盘表
+            const positionsCodes = new Set((this.state.positions || []).map(p => p.code));
+            const src = this.bindingSource || {};
+            const names = this.stockNames || {};
+            const merged = this.mergedList || [];
+            return merged
+                .filter(c => !positionsCodes.has(c))
+                .filter(c => src[c] !== 'real')
+                .map(c => ({ code: c, name: names[c] || '', _zero: true }));
+        },
+        displayPositions() {
+            const pos = (this.state.positions || []).map(p => {
+                const vol = Number(p.volume) || 0;
+                return vol <= 0 ? { ...p, _zero: true } : p;
+            });
+            const seen = new Set(pos.map(p => p.code));
+            const extras = this.zeroPositionRows().filter(r => !seen.has(r.code));
+            return [...pos, ...extras];
+        },
+
+        async applyStrategies() {
+            // 只保留合并监控列表里出现过的票, 避免历史脏数据残留
+            const codes = new Set(this.mergedList || []);
+            const cleaned = {};
+            for (const [code, name] of Object.entries(this.strategyConfig.per_stock || {})) {
+                if (codes.has(code) && name) cleaned[code] = name;
+            }
+            const payload = { default: this.strategyConfig.default, per_stock: cleaned };
+            const r = await App.post('/api/live/strategies/config', payload);
+            this.opLog = r.message;
+            App.toast(r.ok ? '策略配置已应用' : r.message, r.ok ? 'success' : 'warn');
+            if (r.ok) {
+                this.strategyConfig.per_stock = cleaned;
+            }
+        },
+
+        _todayPrefix() {
+            const d = new Date();
+            const y = d.getFullYear();
+            const m = String(d.getMonth() + 1).padStart(2, '0');
+            const day = String(d.getDate()).padStart(2, '0');
+            return `${y}-${m}-${day}`;
+        },
+        // 信号: 按 ts 倒序, 合并连续同向; 首页只露 8 条, 全部进弹窗
+        allSignals() {
+            const all = (this.state.signals || []).slice();
+            all.sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
+            const collapsed = [];
+            for (const s of all) {
+                const prev = collapsed[collapsed.length - 1];
+                const same = prev
+                    && prev.code === s.code
+                    && prev.side === s.side
+                    && (prev.strategy || '') === (s.strategy || '');
+                if (same) {
+                    prev._dupCount = (prev._dupCount || 1) + 1;
+                    if (!prev._firstTs || (s.ts || '') < prev._firstTs) {
+                        prev._firstTs = s.ts;
+                    }
+                    continue;
+                }
+                collapsed.push({ ...s, _dupCount: 1, _firstTs: s.ts });
+            }
+            return collapsed;
+        },
+        recentSignals() {
+            return this.allSignals().slice(0, 8);
+        },
+        // 成交流水: 按 ts 倒序; 右侧卡片只露 5 条, 全部进弹窗
+        allOrders() {
+            const all = (this.state.orders || []).slice();
+            all.sort((a, b) => (b.ts || '').localeCompare(a.ts || ''));
+            return all;
+        },
+        recentOrders() {
+            return this.allOrders().slice(0, 5);
+        },
+
+        renderChart() {
+            // 实盘视图没有 #pnl-chart 元素 (资金曲线只放在 sim 视图), 直接 return 避免 plotly 报错
+            if (!document.getElementById('pnl-chart')) return;
+            const h = this.state.pnl_history || [];
+            const mode = this.chartMode || 'today';
+
+            // 数据过滤: all = 全部历史; today = 仅今天分时
+            const todayStr = this._todayPrefix();
+            let filtered = h;
+            if (mode === 'today') {
+                filtered = h.filter(p => (p.ts || '').slice(0, 10) === todayStr);
+            }
+
+            const ts  = filtered.map(p => p.ts);
+            const pct = filtered.map(p => (p.pnl_pct || 0) * 100);
+            const lastVal = pct.length > 0 ? pct[pct.length - 1] : 0;
+            const lineColor = lastVal >= 0 ? '#10b981' : '#ef4444';   // 涨绿跌红
+
+            const data = filtered.length === 0
+                ? [{ x: [], y: [], type: 'scatter' }]
+                : [{
+                    x: ts, y: pct, type: 'scatter', mode: 'lines+markers',
+                    line: { color: lineColor, width: 2, shape: 'spline' },
+                    marker: { size: 5, color: lineColor },
+                    fill: 'tozeroy',
+                    fillcolor: lastVal >= 0 ? 'rgba(16,185,129,0.10)' : 'rgba(239,68,68,0.10)',
+                    hovertemplate: '%{x}<br>累计盈亏: %{y:.2f}%<extra></extra>',
+                  }];
+
+            // X 轴: today = 9:30-15:00 跳午休; all = 跨日, 跳周末/夜间/午休让线连贯
+            let xaxis;
+            if (mode === 'today') {
+                xaxis = {
+                    type: 'date',
+                    range: [`${todayStr} 09:30:00`, `${todayStr} 15:00:00`],
+                    tickformat: '%H:%M',
+                    tickfont: { size: 10 },
+                    rangebreaks: [
+                        { bounds: [11.5, 13], pattern: 'hour' },
+                    ],
+                };
+            } else {
+                // all 视图: 历史日点每天 1 个 (14:59:00) + 今天分时(9:30-15:00),
+                // 只跳周末就够了; 跳小时反而会把历史 14:59 点和今天分时点压挤变形
+                xaxis = {
+                    type: 'date',
+                    tickformat: '%m-%d',
+                    tickfont: { size: 10 },
+                    rangebreaks: [
+                        { bounds: ['sat', 'mon'], pattern: 'day of week' },
+                    ],
+                };
+            }
+
+            const layout = {
+                margin: { l: 44, r: 16, t: 8, b: 30 },
+                xaxis: xaxis,
+                yaxis: {
+                    tickfont: { size: 10 },
+                    title: { text: '累计盈亏 %', font: { size: 11 } },
+                    zerolinecolor: '#9ca3af', zerolinewidth: 1,
+                    ticksuffix: '%',
+                },
+                showlegend: false,
+                plot_bgcolor: '#fff',
+                shapes: [
+                    { type: 'line', xref: 'paper', x0: 0, x1: 1,
+                      yref: 'y', y0: 0, y1: 0,
+                      line: { color: '#9ca3af', width: 1, dash: 'dot' } },
+                ],
+            };
+            Plotly.react('pnl-chart', data, layout, { displayModeBar: false });
+        },
+
+        setRealMode() {
+            // 切换到实盘模式 -- 强二次确认
+            const ok = confirm(
+                '【高风险确认】\n\n' +
+                '切换到实盘模式后, 启动循环时会连真实 {{ qmt_backend }}, 真实下单到你的券商账户!\n\n' +
+                '请确认:\n' +
+{%- if qmt_is_mini %}
+                '  1. .env 里 QMT_PATH 和 ACCOUNT_ID 已正确配置\n' +
+                '  2. miniQMT 客户端已登录\n' +
+{%- else %}
+                '  1. .env 里 QMT_BASE_URL / QMT_TOKEN 已正确配置 (默认 127.0.0.1:15588)\n' +
+                '  2. QMT 客户端已登录, 且 CY_QMT_API 策略正在运行\n' +
+{%- endif %}
+                '  3. 你愿意承担信号触发后真实买卖的盈亏\n\n' +
+                '继续切换吗?'
+            );
+            if (ok) {
+                this.dryRun = false;
+                App.toast('已切换到实盘模式 (慎用!)', 'danger');
+            }
+        },
+
+        async simStart() {
+            // 实盘模式启动前再次二次确认
+            if (!this.dryRun) {
+                if (!confirm('确认用【实盘模式】启动? 真实下单不可撤销!')) return;
+            }
+            const r = await App.post('/api/live/sim/start',
+                { watch_stocks: this.simWatch, dry_run: this.dryRun });
+            this.opLog = r.message;
+            App.toast(r.ok ? '已启动' : r.message, r.ok ? 'success' : 'warn');
+            await this.refresh();
+        },
+
+        async simStop() {
+            const r = await App.post('/api/live/sim/stop', {});
+            this.opLog = r.message;
+            App.toast(r.message, 'info');
+            await this.refresh();
+        },
+
+        historyStartDate() {
+            return String((this.state.control || {}).history_start_date || '2026-04-01');
+        },
+        resetDraftSlotAmount() {
+            const n = Number(this.resetBook.draftSlots);
+            if (n <= 0) return 0;
+            return (Number(this.resetBook.draftCapital) || 0) / n;
+        },
+        openResetBook() {
+            this.resetBook.startDate = this.historyStartDate();
+            this.resetBook.draftCapital = Number(this.state.capital) || 0;
+            this.resetBook.draftSlots = this.maxSlots();
+            this.resetBook.busy = false;
+            this.resetBook.rows = this.slotCodes().map((code, i) => ({
+                id: 'rst-' + i + '-' + code,
+                code,
+                name: this.stockDisplayName(code),
+                query: this.stockLabel(code, this.stockDisplayName(code)),
+                strategy: this.resolvedExecStrategy(code),
+                suggests: [],
+                searchTimer: null,
+            }));
+            this.resetBook.show = true;
+        },
+        newResetRow() {
+            return {
+                id: 'rst-new-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7),
+                code: '',
+                name: '',
+                query: '',
+                strategy: this.strategyConfig.default || (this.strategyFlat[0] && this.strategyFlat[0].name) || '',
+                suggests: [],
+                searchTimer: null,
+            };
+        },
+        addResetRow() {
+            if (this.resetBook.busy || this.resetBook.rows.length >= Number(this.resetBook.draftSlots)) return;
+            this.resetBook.rows.push(this.newResetRow());
+        },
+        removeResetRow(id) {
+            if (this.resetBook.busy) return;
+            this.resetBook.rows = this.resetBook.rows.filter(r => r.id !== id);
+        },
+        onResetStockInput(row) {
+            const raw = (row.query || '').trim();
+            clearTimeout(row.searchTimer);
+            if (raw.length < 1) {
+                row.suggests = [];
+                return;
+            }
+            const m = raw.match(/^(.+?)[\(（][0-9]{6}\.(?:SH|SZ|BJ)[\)）]$/i);
+            const q = m ? m[1].trim() : raw;
+            if (q.length < 1) {
+                row.suggests = [];
+                return;
+            }
+            row.searchTimer = setTimeout(() => this.searchResetStock(row, q), 220);
+        },
+        resetStockQueryKey(row) {
+            const raw = (row.query || '').trim();
+            const m = raw.match(/^(.+?)[\(（][0-9]{6}\.(?:SH|SZ|BJ)[\)）]$/i);
+            return m ? m[1].trim() : raw;
+        },
+        async searchResetStock(row, q) {
+            try {
+                const res = await App.get('/api/live/stock/search?q=' + encodeURIComponent(q) + '&limit=12');
+                if (this.resetStockQueryKey(row) !== q) return;
+                row.suggests = Array.isArray(res.items) ? res.items : [];
+            } catch (e) {
+                row.suggests = [];
+            }
+        },
+        pickResetStock(row, item) {
+            if (!item || !item.code) return;
+            row.code = item.code;
+            row.name = item.name || item.code;
+            row.query = this.stockLabel(item.code, item.name);
+            row.strategy = this.resolvedExecStrategy(item.code);
+            row.suggests = [];
+        },
+        async confirmResetPositions() {
+            if (this.resetBook.busy) return;
+            const rows = this.resetBook.rows.map(row => ({
+                code: this.extractStockCode(row.query) || row.code,
+                strategy: (row.strategy || '').trim(),
+            }));
+            if (rows.some(r => !r.code || !r.strategy)) {
+                App.toast('每一档都要有股票和策略', 'warn');
+                return;
+            }
+            const capital = Number(this.resetBook.draftCapital);
+            const maxSlots = Number(this.resetBook.draftSlots);
+            if (!(capital > 0)) {
+                App.toast('总资金必须大于 0', 'warn');
+                return;
+            }
+            if (maxSlots < 1 || maxSlots > 10) {
+                App.toast('档数须在 1～10', 'warn');
+                return;
+            }
+            if (rows.length > maxSlots) {
+                App.toast('股票多于档数，先移除或多加档', 'warn');
+                return;
+            }
+            this.resetBook.busy = true;
+            try {
+                const r = await App.post('/api/live/sim/reset_positions', {
+                    start_date: this.resetBook.startDate,
+                    capital,
+                    max_slots: maxSlots,
+                    rows,
+                });
+                this.opLog = (r && r.message) || '';
+                if (r && r.ok) {
+                    App.toast(r.message, 'success');
+                    this.resetBook.show = false;
+                    await this.refresh();
+                } else {
+                    App.toast((r && r.message) || '重置失败', 'danger');
+                }
+            } catch (e) {
+                App.toast('重置失败: ' + (e.message || e), 'danger');
+            } finally {
+                this.resetBook.busy = false;
+            }
+        },
+
+        /** 立即试算一轮: 不等盘中, 按最近一根 K 线让所有已绑策略各跑一次
+         *  - buy/sell 信号会写到信号表 (走完整 loop 含风控+撮合)
+         *  - hold 不写表, 但通过 diagnoses 在弹窗里展示, 答"为什么没有信号" */
+        async trialRunNow() {
+            if (this.trialBusy) return;
+            this.trialBusy = true;
+            this.trialResult = null;
+            try {
+                const r = await App.post('/api/live/sim/trial_run', {});
+                if (r && r.ok) {
+                    App.toast(r.message || '已试算 1 轮', 'success');
+                    this.trialResult = {
+                        summary:   r.summary   || {},
+                        diagnoses: r.diagnoses || [],
+                        message:   r.message   || '',
+                    };
+                } else {
+                    App.toast((r && r.message) || '试算失败 (引擎可能未启动)', 'danger');
+                }
+                await this.refresh();
+            } finally {
+                this.trialBusy = false;
+            }
+        },
+
+        async ctrl(field, value) {
+            const r = await App.post('/api/live/control', { field, value });
+            this.opLog = r.message;
+            App.toast(r.message, 'success');
+            await this.refresh();
+        },
+
+        async setStatus(status) {
+            const r = await App.post('/api/live/status', { status });
+            this.opLog = r.message;
+            App.toast(r.message, 'success');
+            await this.refresh();
+        },
+
+        // 龙头战法 -- 拉候选名单
+        // 数据源: auto (mysql -> QMT) / mysql / xtdata
+        async loadDragonCandidates() {
+            this.dragon.loading = true;
+            try {
+                const params = new URLSearchParams({
+                    source: this.dragon.sourceMode || 'mysql',
+                    version: this.dragon.versionMode || 'v2',
+                });
+                const r = await App.get('/api/dragon/candidates?' + params.toString());
+                this.dragon.items = (r && r.items) || [];
+                this.dragon.source = (r && r.source) || '';
+                this.dragon.version = (r && r.version) || '';
+                this.dragon.tradeDate = (r && r.trade_date) || '';
+                this.dragon.warning = (r && r.warning) || '';
+                this.dragon.loaded = true;
+                if (!this.dragon.items.length) App.toast('没有找到龙头', 'warn');
+            } catch (e) {
+                App.toast('拉龙头候选失败: ' + e, 'danger');
+            } finally {
+                this.dragon.loading = false;
+            }
+        },
+
+        // 版本下拉同时写 strategies.yaml, 主循环下一轮按这个入场
+        async saveDragonVersion() {
+            const version = this.dragon.versionMode;
+            if (version !== 'v1' && version !== 'v2') return;
+            try {
+                const r = await App.post('/api/dragon/version', { version });
+                App.toast(r.message || ('主循环已切到 ' + version), r.ok ? 'success' : 'danger');
+            } catch (e) {
+                App.toast('切换龙头版本失败: ' + e, 'danger');
+            }
+        },
+
+        // 一键把候选写入 watch_pool 并绑 dragon_picker (热加载)
+        async bindDragonAll() {
+            const codes = this.dragon.items.map((x) => x.code);
+            if (codes.length === 0) return;
+            if (!confirm('把 ' + codes.length + ' 只龙头候选加入监控并绑定龙头首板战法 ' + (this.dragon.versionMode || '').toUpperCase() + '?')) return;
+            this.dragon.binding = true;
+            try {
+                const r = await App.post('/api/dragon/bind', {
+                    codes,
+                    version: this.dragon.versionMode,
+                });
+                this.opLog = r.message || '';
+                App.toast(r.message || '完成', r.ok ? 'success' : 'danger');
+                await this.refresh();
+            } catch (e) {
+                App.toast('绑定失败: ' + e, 'danger');
+            } finally {
+                this.dragon.binding = false;
+            }
+        },
+
+        // 危险操作二次确认: action ∈ {'force_clear_all', 'HALTED'}
+        async confirmDanger(action) {
+            const labels = {
+                force_clear_all: { tip: '一键清仓: 下一轮主循环会平掉全部持仓\n\n继续吗?',
+                                   call: () => this.ctrl('force_clear_all', true) },
+                HALTED:          { tip: '强制熔断: 立刻进入 HALTED 状态, 必须人工解除\n\n继续吗?',
+                                   call: () => this.setStatus('HALTED') },
+            };
+            const item = labels[action];
+            if (!item) return;
+            if (!confirm(item.tip)) return;
+            await item.call();
+        },
+    }
+}
+</script>
+{% endblock %}

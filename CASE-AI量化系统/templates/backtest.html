@@ -1,0 +1,874 @@
+{% extends "base.html" %}
+{% block title %}回测 -- AI 量化系统{% endblock %}
+
+{% block plotly %}
+<script src="/static/vendor/plotly.min.js"></script>
+{% endblock %}
+
+{% block content %}
+<div x-data="backtestApp()" x-init="init()">
+
+    <!-- 使用说明 modal -->
+    <div class="modal-overlay" x-show="showHelp" x-cloak @click.self="showHelp = false">
+        <div class="modal-card" style="max-width:680px;">
+            <div class="modal-header">
+                <div class="modal-title">回测 -- 使用说明</div>
+                <button class="modal-close" @click="showHelp = false">×</button>
+            </div>
+            <div class="modal-body">
+                <h4>这个 Tab 干嘛的</h4>
+                <p>选一只股票 + 一段历史 + 一个策略, 看历史上这套策略会怎么交易, 算收益 / 回撤 / 夏普 / 胜率。</p>
+                <h4>典型场景</h4>
+                <ul>
+                    <li><b>给新股票挑策略</b>: 比如想买沪硅产业, 不知道用 MACD 还是 MA20 -> 点「策略对比」, 系统对全部策略各跑一遍, 出一份"实验报告"(横向指标表 + 净值曲线 + 柱状图), 你按需挑 (年化最高 / 回撤最小 / Sharpe 最稳) 后点「绑到 /live」</li>
+                    <li><b>评估单一策略</b>: 想验证某策略在这只股上表现, 直接「运行回测」</li>
+                    <li><b>注</b>: 不做"自动选最优"打分, 业内本来就没有"标准评分公式"; 单一加权打分 (eg 0.4·Sharpe + 0.3·Calmar + 0.3·胜率) 容易过拟合, 不如让你自己看完整指标分布做决策.</li>
+                </ul>
+                <h4>数据 / 策略 / 撮合</h4>
+                <ul>
+                    <li><b>行情</b>: 日 K 前复权。<code>WUCAI_QMT=qmt/miniqmt</code> 直拉券商；<code>tdx</code> 读 MySQL（通达信入库）。见 <code>lib/backtest_data.py</code></li>
+                    <li><b>策略</b>: 与 <code>/live</code> 共用 <code>strategy_registry</code> 日 K evaluator, 不写成 Backtrader 策略类。</li>
+                    <li><b>撮合</b>: 第 5 讲 Backtrader + <code>1b</code>。收盘出信号、次日开盘成交; T+1; 涨跌停/一字板拒单; 佣金+印花税+过户费; 滑点 0.1%; 单根最多吃成交量 10%; 单只 95% 资金、整手 100 股。</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+
+    <!-- banner 文字已移除 (说明放进右上角 ? 帮助 modal); 顶部只留一个浮动「?」按钮防止用户找不到说明 -->
+    <div class="flex justify-end mb-2">
+        <button class="help-btn" @click="showHelp = true" title="使用说明">?</button>
+    </div>
+
+    <div x-show="probeTip" class="banner banner-orange" x-cloak>
+        <div class="banner-text"><b>TIPS</b>　<span x-text="probeTip"></span></div>
+    </div>
+
+    <!-- 全部卡片线性堆叠 (不再 grid-2 左右分栏): 参数 -> 单股回测结果 -> 策略对比报告 -->
+    <div class="flex-col">
+
+            <!-- 输入参数 -->
+            <div class="card">
+                <div class="card-header">
+                    <div class="card-title">参数</div>
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-5 gap-2 items-end">
+                    <div style="position:relative;">
+                        <label class="block text-xs text-gray-600 mb-1">股票代码 / 名称</label>
+                        <input type="text" class="form-control" x-model="form.code"
+                               placeholder="例: 沪硅产业 / 688126.SH"
+                               autocomplete="off"
+                               @input="onBacktestStockInput()"
+                               @keyup.enter="runOnce()">
+                        <div x-show="stockSuggests.length > 0" x-cloak class="stock-suggest-list">
+                            <template x-for="item in stockSuggests" :key="'bt-' + item.code">
+                                <button type="button" class="stock-suggest-item"
+                                        @click="pickBacktestStock(item)">
+                                    <span class="stock-suggest-name" x-text="item.name"></span>
+                                    <span class="stock-suggest-code" x-text="item.code"></span>
+                                </button>
+                            </template>
+                        </div>
+                    </div>
+                    <div>
+                        <label class="block text-xs text-gray-600 mb-1">起始日期</label>
+                        <input type="date" class="form-control" x-model="form.start">
+                    </div>
+                    <div>
+                        <label class="block text-xs text-gray-600 mb-1">结束日期</label>
+                        <input type="date" class="form-control" x-model="form.end">
+                    </div>
+                    <div>
+                        <label class="block text-xs text-gray-600 mb-1">策略</label>
+                        <select class="form-control" x-model="form.strategy">
+                            <template x-for="s in strategies" :key="s.name">
+                                <option :value="s.name" x-text="s.label"></option>
+                            </template>
+                        </select>
+                    </div>
+                    <div class="flex gap-2">
+                        <button class="btn btn-primary" @click="runOnce()" :disabled="busy">
+                            <span x-show="!busy">运行回测</span>
+                            <span x-show="busy">运行中...</span>
+                        </button>
+                        <button class="btn btn-secondary" @click="recommend()" :disabled="recBusy"
+                                title="对所有策略各跑一遍, 横向对比指标 + 净值曲线 (实验报告)">
+                            <span x-show="!recBusy">策略对比</span>
+                            <span x-show="recBusy">回测中...</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- 错误提示 -->
+                <div x-show="errMsg" class="mt-2 text-sm text-rose-700 bg-rose-50 border border-rose-200 rounded px-3 py-2"
+                     x-text="errMsg"></div>
+            </div>
+
+            <!-- 指标摘要 -->
+            <div class="card" x-show="result" x-cloak>
+                <div class="card-header">
+                    <div>
+                        <div class="card-title">
+                            指标 <span class="text-gray-500 text-sm font-normal"
+                                      x-text="result ? '— ' + result.stock_name + ' (' + result.stock_code + ') · ' + result.strategy_label : ''"></span>
+                        </div>
+                        <div class="text-xs text-gray-500 font-normal mt-0.5"
+                             x-show="result"
+                             x-text="(result && result.params && result.metrics) ? (result.params.start_date + ' ~ ' + result.params.end_date + ' · ' + result.metrics.trading_days + ' 个交易日') : ''"></div>
+                    </div>
+                </div>
+                <div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm" x-show="result">
+                    <div>
+                        <div class="text-xs text-gray-500">总收益</div>
+                        <div class="text-xl num" :class="metricCls(result?.metrics.total_return)"
+                             x-text="App.fmtPct(result?.metrics.total_return || 0)"></div>
+                        <div class="text-xs text-gray-500">基准 (买入持有):
+                            <span x-text="App.fmtPct(result?.buy_hold.total_return || 0)"></span>
+                        </div>
+                    </div>
+                    <div>
+                        <div class="text-xs text-gray-500">年化</div>
+                        <div class="text-xl num" :class="metricCls(result?.metrics.annual_return)"
+                             x-text="App.fmtPct(result?.metrics.annual_return || 0)"></div>
+                        <div class="text-xs text-gray-500">基准:
+                            <span x-text="App.fmtPct(result?.buy_hold.annual_return || 0)"></span>
+                        </div>
+                    </div>
+                    <div>
+                        <div class="text-xs text-gray-500">最大回撤</div>
+                        <div class="text-xl num neg" x-text="'-' + App.fmtPct(result?.metrics.max_drawdown || 0)"></div>
+                        <div class="text-xs text-gray-500">持续 <span x-text="result?.metrics.max_dd_len || 0"></span> 个交易日</div>
+                    </div>
+                    <div>
+                        <div class="text-xs text-gray-500">夏普 / 卡玛</div>
+                        <div class="text-xl num" x-text="App.fmtNum(result?.metrics.sharpe_ratio, 2) + ' / ' + App.fmtNum(result?.metrics.calmar_ratio, 2)"></div>
+                        <div class="text-xs text-gray-500">越大越稳</div>
+                    </div>
+                    <div>
+                        <div class="text-xs text-gray-500">交易次数</div>
+                        <div class="text-xl num" x-text="result?.metrics.total_trades || 0"></div>
+                        <div class="text-xs text-gray-500">
+                            <span x-text="'胜 ' + (result?.metrics.won_trades || 0)"></span> /
+                            <span x-text="'负 ' + (result?.metrics.lost_trades || 0)"></span>
+                        </div>
+                    </div>
+                    <div>
+                        <div class="text-xs text-gray-500">胜率</div>
+                        <div class="text-xl num" x-text="App.fmtPct(result?.metrics.win_rate || 0)"></div>
+                        <div class="text-xs text-gray-500">
+                            最大连亏 <span x-text="result?.metrics.max_consecutive_losses || 0"></span> 次
+                        </div>
+                    </div>
+                    <div>
+                        <div class="text-xs text-gray-500">盈亏比</div>
+                        <div class="text-xl num" x-text="App.fmtNum(result?.metrics.profit_loss_ratio, 2)"></div>
+                        <div class="text-xs text-gray-500">利润因子 <span x-text="App.fmtNum(result?.metrics.profit_factor, 2)"></span></div>
+                    </div>
+                    <div>
+                        <div class="text-xs text-gray-500">最终市值</div>
+                        <div class="text-xl num" x-text="App.fmtNum(result?.metrics.final_value || 0, 0)"></div>
+                        <div class="text-xs text-gray-500">初始 <span x-text="App.fmtNum(result?.metrics.initial_cash || 0, 0)"></span></div>
+                    </div>
+                </div>
+                <!-- 写入 strategies.yaml 按钮 (单策略也方便从这一步直接应用) -->
+                <div class="mt-3 pt-3 border-t border-gray-100 text-xs text-gray-600 flex items-center gap-3"
+                     x-show="result?.ok">
+                    <button class="btn btn-secondary btn-sm" @click="applySingle()" :disabled="applyBusy">
+                        <span x-show="!applyBusy">应用到模拟盘</span>
+                        <span x-show="applyBusy">写入中...</span>
+                    </button>
+                    <span>写入该股策略并按新策略重放模拟盘。只影响模拟盘, 不会进实盘授权。</span>
+                </div>
+            </div>
+
+            <!-- K 线 + 买卖箭头 (与 /live 弹窗同款: MA + 成交量 + 买卖点) -->
+            <div class="card" x-show="result" x-cloak>
+                <div class="card-header">
+                    <div>
+                        <div class="card-title">K 线 + 买卖点</div>
+                        <div class="card-subtitle">日 K · 前复权 · MA5/10/20 · 成交量 · 红三角买 / 绿三角卖</div>
+                    </div>
+                </div>
+                <div id="bt-kline-chart" class="kline-chart-box" style="height:460px;border:none;"></div>
+            </div>
+
+            <!-- 净值曲线 vs 买入持有 -->
+            <div class="card" x-show="result" x-cloak>
+                <div class="card-header">
+                    <div class="card-title">净值曲线 (策略 vs 买入持有)</div>
+                </div>
+                <div id="bt-nav-chart" style="width:100%;height:240px;"></div>
+            </div>
+
+            <!-- 信号 + 交易表 -->
+            <div class="grid-2" x-show="result" x-cloak>
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title">信号 (策略给的所有方向)</div>
+                        <span class="text-xs text-gray-500" x-text="(result?.signals || []).length + ' 条'"></span>
+                    </div>
+                    <template x-if="(result?.signals || []).length === 0">
+                        <div class="text-gray-400 text-sm py-3 text-center">(策略未在区间内给出 buy/sell)</div>
+                    </template>
+                    <template x-if="(result?.signals || []).length > 0">
+                        <div style="max-height:340px;overflow:auto;">
+                            <table class="app-table">
+                                <thead><tr><th>日期</th><th>方向</th><th>原因</th></tr></thead>
+                                <tbody>
+                                    <template x-for="(s, i) in (result?.signals || [])" :key="i">
+                                        <tr>
+                                            <td class="num" x-text="s.date"></td>
+                                            <td>
+                                                <span class="badge"
+                                                      :class="s.side === 'buy' ? 'badge-success' : 'badge-danger'"
+                                                      x-text="s.side"></span>
+                                            </td>
+                                            <td class="text-xs text-gray-600" x-text="s.reason || '-'"></td>
+                                        </tr>
+                                    </template>
+                                </tbody>
+                            </table>
+                        </div>
+                    </template>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-title">成交 (撮合明细)</div>
+                        <span class="text-xs text-gray-500" x-text="(result?.trades || []).length + ' 笔'"></span>
+                    </div>
+                    <template x-if="(result?.trades || []).length === 0">
+                        <div class="text-gray-400 text-sm py-3 text-center">(没有成交)</div>
+                    </template>
+                    <template x-if="(result?.trades || []).length > 0">
+                        <div style="max-height:340px;overflow:auto;">
+                            <table class="app-table">
+                                <thead><tr>
+                                    <th>日期</th><th>方向</th>
+                                    <th class="text-right">价格</th>
+                                    <th class="text-right">数量</th>
+                                    <th class="text-right">单笔盈亏</th>
+                                </tr></thead>
+                                <tbody>
+                                    <template x-for="(t, i) in (result?.trades || [])" :key="i">
+                                        <tr>
+                                            <td class="num" x-text="t.date"></td>
+                                            <td>
+                                                <span class="badge"
+                                                      :class="t.side === 'buy' ? 'badge-success' : 'badge-danger'"
+                                                      x-text="t.side"></span>
+                                            </td>
+                                            <td class="text-right num" x-text="App.fmtNum(t.price, 2)"></td>
+                                            <td class="text-right num" x-text="t.size"></td>
+                                            <td class="text-right num"
+                                                :class="t.side === 'sell' ? (t.pnl > 0 ? 'pos' : (t.pnl < 0 ? 'neg' : '')) : 'text-gray-400'"
+                                                x-text="t.side === 'sell' ? App.fmtSign(t.pnl, 2) : '-'"></td>
+                                        </tr>
+                                    </template>
+                                </tbody>
+                            </table>
+                        </div>
+                    </template>
+                </div>
+            </div>
+
+        <!-- ==================== 策略对比报告 (实验报告式) ====================
+             点上方「策略对比」按钮触发, 对当前股票 + 区间跑全部策略, 横向呈现:
+               - 概览统计 (跑了多少 / 成功 / 失败)
+               - 横向指标对比表 (可点表头排序)
+               - 净值曲线对比图 (所有策略 + 买入持有 同框)
+               - 关键指标柱状图 (总收益 / 最大回撤 / Sharpe)
+             不再做"加权打分挑最优", 让用户自己看实验结果决定 -->
+        <div class="card" x-show="recommendation || recBusy" x-cloak>
+            <div class="card-header">
+                <div>
+                    <div class="card-title">策略对比报告</div>
+                    <div class="text-xs text-gray-500 font-normal mt-0.5">
+                        对同一股票 + 同一区间, 把全部策略各跑一遍, 横向对比指标 / 净值;
+                        默认按年化收益降序, 表头可点切换.
+                    </div>
+                </div>
+                <span class="text-xs text-gray-500" x-show="recommendation"
+                      x-text="'共 ' + ((recommendation?.summaries || []).length + (recommendation?.failed || []).length)
+                              + ' 个策略 · 成功 ' + (recommendation?.summaries || []).length
+                              + ' · 失败 ' + (recommendation?.failed || []).length"></span>
+            </div>
+
+            <template x-if="recBusy && !recommendation">
+                <div class="text-gray-500 text-sm py-6 text-center">
+                    正在跑全部策略, 单只票通常需要 5-15 秒, 请稍候...
+                </div>
+            </template>
+
+            <template x-if="recommendation">
+                <div>
+                    <!-- 顶部一句概要: 不强加最优, 只做事实陈述 -->
+                    <div class="text-xs text-gray-600 mb-3 leading-relaxed">
+                        <span x-show="recommendation?.summaries?.length > 0">
+                            年化最高: <b class="text-emerald-700"
+                                          x-text="recommendation?.ranked?.[0]?.label || '-'"></b>
+                            (年化 <span x-text="App.fmtPct(recommendation?.ranked?.[0]?.annual_return || 0)"></span>);
+                        </span>
+                        <span x-show="recommendation?.summaries?.length > 0">
+                            最低回撤:
+                            <b class="text-indigo-700"
+                               x-text="lowestDrawdown(recommendation)?.label || '-'"></b>
+                            (<span x-text="'-' + App.fmtPct(lowestDrawdown(recommendation)?.max_drawdown || 0)"></span>);
+                        </span>
+                        <span x-show="recommendation?.summaries?.length > 0">
+                            最高夏普:
+                            <b class="text-amber-700"
+                               x-text="highestSharpe(recommendation)?.label || '-'"></b>
+                            (<span x-text="App.fmtNum(highestSharpe(recommendation)?.sharpe, 2)"></span>).
+                        </span>
+                        <span class="text-gray-400">数据有限, 仅作历史参考, 不代表未来.</span>
+                    </div>
+
+                    <!-- 横向指标对比表: 可点表头排序 -->
+                    <div class="overflow-x-auto">
+                    <table class="app-table">
+                        <thead><tr>
+                            <th>策略</th>
+                            <th class="text-right cursor-pointer hover:text-indigo-700" @click="sortCompareBy('total_return')">
+                                总收益 <span x-show="cmpSort.key==='total_return'" x-text="cmpSort.dir==='desc'?'▼':'▲'"></span>
+                            </th>
+                            <th class="text-right cursor-pointer hover:text-indigo-700" @click="sortCompareBy('annual_return')">
+                                年化 <span x-show="cmpSort.key==='annual_return'" x-text="cmpSort.dir==='desc'?'▼':'▲'"></span>
+                            </th>
+                            <th class="text-right cursor-pointer hover:text-indigo-700" @click="sortCompareBy('max_drawdown')">
+                                最大回撤 <span x-show="cmpSort.key==='max_drawdown'" x-text="cmpSort.dir==='desc'?'▼':'▲'"></span>
+                            </th>
+                            <th class="text-right cursor-pointer hover:text-indigo-700" @click="sortCompareBy('sharpe')">
+                                Sharpe <span x-show="cmpSort.key==='sharpe'" x-text="cmpSort.dir==='desc'?'▼':'▲'"></span>
+                            </th>
+                            <th class="text-right cursor-pointer hover:text-indigo-700" @click="sortCompareBy('calmar')">
+                                Calmar <span x-show="cmpSort.key==='calmar'" x-text="cmpSort.dir==='desc'?'▼':'▲'"></span>
+                            </th>
+                            <th class="text-right cursor-pointer hover:text-indigo-700" @click="sortCompareBy('win_rate')">
+                                胜率 <span x-show="cmpSort.key==='win_rate'" x-text="cmpSort.dir==='desc'?'▼':'▲'"></span>
+                            </th>
+                            <th class="text-right cursor-pointer hover:text-indigo-700" @click="sortCompareBy('profit_factor')">
+                                盈亏比
+                            </th>
+                            <th class="text-right cursor-pointer hover:text-indigo-700" @click="sortCompareBy('trades')">
+                                交易
+                            </th>
+                            <th></th>
+                        </tr></thead>
+                        <tbody>
+                            <template x-for="(r, i) in sortedCompare()" :key="r.strategy">
+                                <tr>
+                                    <td>
+                                        <span class="text-xs" x-text="r.label || r.strategy"></span>
+                                        <span class="text-xs text-gray-300 ml-1" x-text="'(' + r.strategy + ')'"></span>
+                                    </td>
+                                    <td class="text-right num"
+                                        :class="metricCls(r.total_return)"
+                                        x-text="App.fmtPct(r.total_return || 0)"></td>
+                                    <td class="text-right num"
+                                        :class="metricCls(r.annual_return)"
+                                        x-text="App.fmtPct(r.annual_return || 0)"></td>
+                                    <td class="text-right num neg"
+                                        x-text="'-' + App.fmtPct(r.max_drawdown || 0)"></td>
+                                    <td class="text-right num"
+                                        :class="metricCls(r.sharpe)"
+                                        x-text="App.fmtNum(r.sharpe, 2)"></td>
+                                    <td class="text-right num"
+                                        :class="metricCls(r.calmar)"
+                                        x-text="App.fmtNum(r.calmar, 2)"></td>
+                                    <td class="text-right num"
+                                        x-text="App.fmtPct(r.win_rate || 0)"></td>
+                                    <td class="text-right num"
+                                        x-text="App.fmtNum(r.profit_factor, 2)"></td>
+                                    <td class="text-right num">
+                                        <span x-text="r.trades || 0"></span>
+                                        <span class="text-gray-400 text-xs"
+                                              x-show="(r.trades || 0) > 0"
+                                              x-text="' (胜' + (r.won||0) + ')'"></span>
+                                    </td>
+                                    <td class="text-right">
+                                        <button class="btn btn-secondary btn-sm" style="padding:2px 8px;font-size:10px;"
+                                                @click="applyRecommended(r.strategy)"
+                                                :disabled="applyBusy"
+                                                title="写入 strategies.yaml.per_stock 并热加载到 /live">
+                                            绑到 /live
+                                        </button>
+                                    </td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                    </div>
+
+                    <!-- 失败的策略一行说明, 不占视觉空间 -->
+                    <div x-show="(recommendation?.failed || []).length > 0"
+                         class="text-xs text-amber-700 mt-2 leading-relaxed">
+                        失败策略:
+                        <template x-for="(f, i) in (recommendation?.failed || [])" :key="i">
+                            <span class="ml-1" x-text="f.strategy + ' (' + f.error + ')'"></span>
+                        </template>
+                    </div>
+
+                    <!-- 净值曲线对比图 (所有策略 + 买入持有 同框) -->
+                    <div class="mt-4 pt-3 border-t border-gray-100">
+                        <div class="text-sm font-semibold text-gray-700 mb-1">净值曲线对比</div>
+                        <div class="text-xs text-gray-500 mb-2">起点 1.0; 灰色虚线 = 买入持有基准, 彩色 = 各策略净值</div>
+                        <div id="bt-compare-nav-chart" style="width:100%;height:320px;"></div>
+                    </div>
+
+                    <!-- 关键指标柱状图: 让"哪个赚得多 / 哪个回撤小 / 哪个 Sharpe 高"一眼可视化 -->
+                    <div class="mt-4 pt-3 border-t border-gray-100">
+                        <div class="text-sm font-semibold text-gray-700 mb-1">关键指标柱状图</div>
+                        <div class="text-xs text-gray-500 mb-2">总收益 (越高越好) · 最大回撤 (越低越好, 用绝对值) · Sharpe (越高越稳)</div>
+                        <div id="bt-compare-bar-chart" style="height:280px;"></div>
+                    </div>
+                </div>
+            </template>
+        </div>
+
+    </div>
+</div>
+
+<script>
+function backtestApp() {
+    // 默认日期: 最近 1 年
+    const today = new Date();
+    const oneYearAgo = new Date();
+    oneYearAgo.setFullYear(today.getFullYear() - 1);
+    const fmt = (d) => d.toISOString().slice(0, 10);
+
+    return {
+        showHelp: false,
+        ping: null,
+        strategies: [],
+        form: {
+            code: '沪硅产业(688126.SH)',
+            start: fmt(oneYearAgo),
+            end:   fmt(today),
+            strategy: 'macd_1d',
+        },
+        stockSuggests: [],
+        stockSearchTimer: null,
+        busy: false,
+        recBusy: false,
+        applyBusy: false,
+        errMsg: '',
+        probeTip: '',
+        result: null,
+        recommendation: null,
+        cmpSort: { key: 'annual_return', dir: 'desc' },  // 对比表当前排序键 (默认年化降序)
+
+        async init() {
+            // 拉策略列表 + ping 数据源
+            try {
+                const sres = await App.get('/api/backtest/strategies');
+                this.strategies = (sres && sres.list) ? sres.list : [];
+                if (this.strategies.length > 0
+                        && !this.strategies.find(s => s.name === this.form.strategy)) {
+                    this.form.strategy = this.strategies[0].name;
+                }
+            } catch (e) { console.error('strategies', e); }
+            try {
+                this.ping = await App.get('/api/backtest/ping');
+                this.probeTip = (this.ping && this.ping.tip) || '';
+            } catch (e) { console.error('ping', e); }
+        },
+
+        stockLabel(code, name) {
+            const c = (code || '').trim();
+            const n = (name || '').trim();
+            if (n && c && n !== c) return n + '(' + c + ')';
+            return c || n;
+        },
+
+        /** 输入框可能是「中芯国际(688981.SH)」, 提交前拆出代码 */
+        extractStockCode(raw) {
+            const s = (raw || '').trim();
+            const m = s.match(/[\(（]([0-9]{6}\.(?:SH|SZ|BJ))[\)）]\s*$/i);
+            if (m) return m[1].toUpperCase();
+            return s;
+        },
+
+        onBacktestStockInput() {
+            const q = (this.form.code || '').trim();
+            clearTimeout(this.stockSearchTimer);
+            if (q.length < 1) {
+                this.stockSuggests = [];
+                return;
+            }
+            // 已是「名称(代码)」完整选中态时不再刷候选
+            if (/\([0-9]{6}\.(SH|SZ|BJ)\)$/i.test(q)) {
+                this.stockSuggests = [];
+                return;
+            }
+            this.stockSearchTimer = setTimeout(() => this.searchBacktestStocks(q), 220);
+        },
+
+        async searchBacktestStocks(q) {
+            try {
+                // 复用实盘页同款搜索 (trade_stock_status 代码/名称)
+                const res = await App.get('/api/live/stock/search?q=' + encodeURIComponent(q) + '&limit=12');
+                if ((this.form.code || '').trim() !== q) return;
+                this.stockSuggests = Array.isArray(res.items) ? res.items : [];
+            } catch (e) {
+                console.error('searchBacktestStocks', e);
+                this.stockSuggests = [];
+            }
+        },
+
+        pickBacktestStock(item) {
+            if (!item || !item.code) return;
+            this.form.code = this.stockLabel(item.code, item.name);
+            this.stockSuggests = [];
+        },
+
+        metricCls(v) {
+            if (v === null || v === undefined || isNaN(v)) return '';
+            return Number(v) > 0 ? 'pos' : (Number(v) < 0 ? 'neg' : '');
+        },
+
+        async runOnce() {
+            if (this.busy) return;
+            this.errMsg = '';
+            this.busy = true;
+            try {
+                const r = await App.post('/api/backtest/run', {
+                    code:     this.extractStockCode(this.form.code),
+                    strategy: this.form.strategy,
+                    start:    this.form.start,
+                    end:      this.form.end,
+                });
+                if (r && r.ok) {
+                    this.result = r;
+                    if (r.stock_code) {
+                        this.form.code = this.stockLabel(r.stock_code, r.stock_name);
+                    }
+                    this.stockSuggests = [];
+                    this.$nextTick(() => {
+                        requestAnimationFrame(() => {
+                            this.renderKlineChart();
+                            this.renderNavChart();
+                        });
+                    });
+                } else {
+                    if (r && Array.isArray(r.candidates) && r.candidates.length) {
+                        this.stockSuggests = r.candidates;
+                    }
+                    this.errMsg = (r && r.message) || '回测失败';
+                    if (r && r.tip) this.probeTip = r.tip;
+                }
+            } catch (e) {
+                this.errMsg = String(e);
+            } finally {
+                this.busy = false;
+            }
+        },
+
+        async recommend() {
+            if (this.recBusy) return;
+            this.errMsg = '';
+            this.recBusy = true;
+            try {
+                const r = await App.post('/api/backtest/recommend', {
+                    code:  this.extractStockCode(this.form.code),
+                    start: this.form.start,
+                    end:   this.form.end,
+                });
+                if (r && r.ok) {
+                    this.recommendation = r;
+                    if (r.stock_code) {
+                        this.form.code = this.stockLabel(r.stock_code, r.stock_name);
+                    }
+                    this.stockSuggests = [];
+                    const n = (r.summaries || []).length;
+                    const f = (r.failed || []).length;
+                    App.toast('对比完成: 成功 ' + n + ' / 失败 ' + f, n > 0 ? 'success' : 'warn');
+                    this.$nextTick(() => {
+                        requestAnimationFrame(() => {
+                            this.renderCompareNavChart();
+                            this.renderCompareBarChart();
+                        });
+                    });
+                } else {
+                    if (r && Array.isArray(r.candidates) && r.candidates.length) {
+                        this.stockSuggests = r.candidates;
+                    }
+                    this.errMsg = (r && r.message) || '对比失败';
+                    if (r && r.tip) this.probeTip = r.tip;
+                }
+            } catch (e) {
+                this.errMsg = String(e);
+            } finally {
+                this.recBusy = false;
+            }
+        },
+
+        // ---------- 策略对比报告 辅助方法 ----------
+        /** 表头点击切换排序; 同 key 再点反向, 不同 key 默认 desc */
+        sortCompareBy(key) {
+            if (this.cmpSort.key === key) {
+                this.cmpSort.dir = this.cmpSort.dir === 'desc' ? 'asc' : 'desc';
+            } else {
+                this.cmpSort.key = key;
+                this.cmpSort.dir = 'desc';
+            }
+        },
+        /** 按当前 cmpSort 对 summaries 排序; 失败列表不在这里 */
+        sortedCompare() {
+            const arr = ((this.recommendation || {}).summaries || []).slice();
+            const k = this.cmpSort.key;
+            const dir = this.cmpSort.dir === 'asc' ? 1 : -1;
+            arr.sort((a, b) => {
+                const va = Number(a[k]) || 0;
+                const vb = Number(b[k]) || 0;
+                if (va === vb) return 0;
+                return va > vb ? dir : -dir;
+            });
+            return arr;
+        },
+        // x 用 0..n-1, 刻度只显示日期文字. 不能把 YYYY-MM-DD 当 x, Plotly 会当成日历轴, 右侧多留空
+        navAxis(dates) {
+            const n = (dates || []).length;
+            const last = Math.max(n - 1, 0);
+            const tickvals = [];
+            const ticktext = [];
+            const k = Math.min(6, n);
+            if (n === 1) {
+                tickvals.push(0);
+                ticktext.push(dates[0]);
+            } else if (n > 1) {
+                for (let i = 0; i < k; i++) {
+                    const j = Math.round(i * (n - 1) / (k - 1));
+                    tickvals.push(j);
+                    ticktext.push(dates[j]);
+                }
+            }
+            return {
+                type: 'linear',
+                autorange: false,
+                range: [0, last],
+                tickmode: 'array',
+                tickvals,
+                ticktext,
+                tickfont: { size: 10 },
+                fixedrange: true,
+                zeroline: false,
+                showgrid: false,
+                automargin: false,
+                constrain: 'domain',
+            };
+        },
+
+        paintNav(el, traces, dates) {
+            if (!el || !window.Plotly) return;
+            const n = (dates || []).length;
+            const last = Math.max(n - 1, 0);
+            const layout = {
+                autosize: true,
+                margin: { l: 50, r: 8, t: 8, b: 36 },
+                xaxis: this.navAxis(dates),
+                yaxis: { tickfont: { size: 10 }, title: { text: '净值 (起点 1.0)', font: { size: 11 } }, automargin: true },
+                shapes: [
+                    { type: 'line', xref: 'paper', x0: 0, x1: 1, yref: 'y', y0: 1, y1: 1,
+                      line: { color: '#9ca3af', width: 1, dash: 'dot' } },
+                ],
+                showlegend: true, legend: { x: 0.01, y: 0.99, font: { size: 10 } },
+                plot_bgcolor: '#fff',
+            };
+            Plotly.purge(el);
+            Plotly.newPlot(el, traces, layout, { displayModeBar: false, responsive: true });
+            const fit = () => {
+                Plotly.Plots.resize(el);
+                Plotly.relayout(el, { 'xaxis.autorange': false, 'xaxis.range': [0, last] });
+            };
+            requestAnimationFrame(fit);
+            setTimeout(fit, 80);
+        },
+
+        /** 找最大回撤最小的策略 (max_drawdown 是正数, 越小越好) */
+        lowestDrawdown(rec) {
+            const arr = ((rec || {}).summaries || []).filter(s => (s.trades || 0) > 0);
+            if (!arr.length) return null;
+            return arr.reduce((min, s) => (s.max_drawdown < min.max_drawdown ? s : min), arr[0]);
+        },
+        /** 找 Sharpe 最高的策略 */
+        highestSharpe(rec) {
+            const arr = ((rec || {}).summaries || []).filter(s => (s.trades || 0) > 0);
+            if (!arr.length) return null;
+            return arr.reduce((max, s) => (s.sharpe > max.sharpe ? s : max), arr[0]);
+        },
+
+        /** 净值曲线对比图: 所有策略 + 买入持有 同框
+         *  数据来自 recommendation.nav_series (每只策略一条) + recommendation.buy_hold (基准) */
+        renderCompareNavChart() {
+            if (!window.Plotly) return;
+            const el = document.getElementById('bt-compare-nav-chart');
+            if (!el) return;
+            const rec = this.recommendation;
+            if (!rec) return;
+            const nav_series = rec.nav_series || {};
+            const bh = rec.buy_hold || [];
+            const labelMap = {};
+            (rec.summaries || []).forEach(s => { labelMap[s.strategy] = s.label || s.strategy; });
+
+            // Plotly 默认色板; 让线条颜色稳定区分
+            const palette = ['#4f46e5', '#dc2626', '#059669', '#d97706', '#0891b2',
+                             '#7c3aed', '#db2777', '#65a30d', '#e11d48', '#0ea5e9'];
+            const traces = [];
+            let i = 0;
+            let axisDates = bh.length ? bh.map(p => p.date) : [];
+            Object.keys(nav_series).forEach(name => {
+                const arr = nav_series[name] || [];
+                if (!arr.length) return;
+                if (!axisDates.length) axisDates = arr.map(p => p.date);
+                traces.push({
+                    type: 'scatter', mode: 'lines',
+                    x: arr.map((_, j) => j),
+                    y: arr.map(p => p.nav),
+                    text: arr.map(p => p.date),
+                    line: { color: palette[i % palette.length], width: 1.5 },
+                    name: labelMap[name] || name,
+                    hovertemplate: '%{text}<br>' + (labelMap[name] || name) + ' %{y:.4f}<extra></extra>',
+                });
+                i += 1;
+            });
+            if (bh.length > 0) {
+                traces.push({
+                    type: 'scatter', mode: 'lines',
+                    x: bh.map((_, j) => j),
+                    y: bh.map(p => p.nav),
+                    text: bh.map(p => p.date),
+                    line: { color: '#9ca3af', width: 2, dash: 'dash' },
+                    name: '买入持有',
+                    hovertemplate: '%{text}<br>买入持有 %{y:.4f}<extra></extra>',
+                });
+            }
+
+            this.paintNav(el, traces, axisDates);
+        },
+
+        /** 关键指标柱状图: 3 组并排 (总收益 / 最大回撤 / Sharpe), 横轴 = 策略
+         *  最大回撤取绝对值方便和总收益对比 (柱越高表示亏越多, 不是好事) */
+        renderCompareBarChart() {
+            if (!window.Plotly) return;
+            const el = document.getElementById('bt-compare-bar-chart');
+            if (!el) return;
+            const rec = this.recommendation;
+            if (!rec) return;
+            const arr = (rec.summaries || []).slice();
+            if (!arr.length) return;
+            // 按当前表排序保持一致, 让用户对得上
+            const sorted = this.sortedCompare();
+            const names = sorted.map(s => s.label || s.strategy);
+            const totalReturn = sorted.map(s => Number((s.total_return * 100).toFixed(2)));
+            const drawdown    = sorted.map(s => Number((s.max_drawdown * 100).toFixed(2)));
+            const sharpe      = sorted.map(s => Number((s.sharpe).toFixed(2)));
+
+            const data = [
+                { type: 'bar', x: names, y: totalReturn,
+                  marker: { color: '#10b981' },
+                  name: '总收益 %',
+                  hovertemplate: '%{x}<br>总收益 %{y:.2f}%<extra></extra>' },
+                { type: 'bar', x: names, y: drawdown,
+                  marker: { color: '#ef4444' },
+                  name: '最大回撤 % (越低越好)',
+                  hovertemplate: '%{x}<br>最大回撤 %{y:.2f}%<extra></extra>' },
+                { type: 'bar', x: names, y: sharpe,
+                  marker: { color: '#6366f1' },
+                  name: 'Sharpe (右轴)',
+                  yaxis: 'y2',
+                  hovertemplate: '%{x}<br>Sharpe %{y:.2f}<extra></extra>' },
+            ];
+            const layout = {
+                margin: { l: 50, r: 50, t: 8, b: 80 },
+                barmode: 'group',
+                xaxis: { tickfont: { size: 10 }, tickangle: -25 },
+                yaxis: { tickfont: { size: 10 }, title: { text: '收益 / 回撤 %', font: { size: 11 } },
+                         ticksuffix: '%' },
+                yaxis2: { tickfont: { size: 10 }, title: { text: 'Sharpe', font: { size: 11 } },
+                          overlaying: 'y', side: 'right' },
+                showlegend: true, legend: { orientation: 'h', x: 0.5, xanchor: 'center', y: 1.12, font: { size: 10 } },
+                plot_bgcolor: '#fff',
+            };
+            Plotly.react('bt-compare-bar-chart', data, layout, { displayModeBar: false });
+        },
+
+        async applySingle() {
+            if (!this.result || !this.result.ok) return;
+            await this._applyTo(this.result.stock_code, this.result.strategy);
+        },
+
+        async applyRecommended(strategy) {
+            const code = (this.recommendation && this.recommendation.stock_code)
+                || this.extractStockCode(this.form.code || '');
+            if (!code || !strategy) return;
+            await this._applyTo(code, strategy);
+        },
+
+        async _applyTo(code, strategy) {
+            if (this.applyBusy) return;
+            code = this.extractStockCode(code);
+            if (!code || !strategy) return;
+            this.applyBusy = true;
+            try {
+                const r = await App.post('/api/backtest/recommend_apply',
+                                          { code, strategy });
+                if (r && r.ok) {
+                    const stock = (this.result && this.result.stock_name) || r.stock_name || code;
+                    const meta = (this.strategies || []).find(s => s.name === strategy);
+                    const label = meta ? (meta.display || meta.label) : strategy;
+                    App.toast(stock + ' 已按「' + label + '」应用到模拟盘', 'success');
+                } else {
+                    App.toast((r && r.message) || '应用失败', 'danger');
+                }
+            } finally {
+                this.applyBusy = false;
+            }
+        },
+
+        // ============ 图表 ============
+
+        renderKlineChart() {
+            // 与 /live 弹窗共用 App.renderStockKline (MA + 成交量 + 买卖点)
+            const k = (this.result && this.result.kline) || [];
+            if (!k.length || !window.App || !App.renderStockKline) return;
+            App.renderStockKline('bt-kline-chart', {
+                bars: k,
+                trades: (this.result && this.result.trades) || [],
+            });
+        },
+
+        renderNavChart() {
+            const navs = (this.result && this.result.navs) || [];
+            const k = (this.result && this.result.kline) || [];
+            if (!navs.length || !window.Plotly) return;
+            const initial = (this.result.metrics && this.result.metrics.initial_cash) || 1;
+            const dates = navs.map(p => p.date);
+            const xs = dates.map((_, i) => i);
+            const stratNav = navs.map(p => p.nav / initial);
+            // 同期买入持有: 用 K 线第一根开盘做基准
+            let bhSeries = [];
+            if (k.length > 0) {
+                const baseOpen = k[0].open || 1;
+                const closeMap = new Map(k.map(b => [b.date, b.close]));
+                bhSeries = dates.map(d => {
+                    const c = closeMap.get(d);
+                    return c ? c / baseOpen : null;
+                });
+            }
+            const el = document.getElementById('bt-nav-chart');
+            if (!el) return;
+            const data = [
+                { type: 'scatter', mode: 'lines', x: xs, y: stratNav, text: dates,
+                  line: { color: '#4f46e5', width: 2 }, name: '策略净值',
+                  hovertemplate: '%{text}<br>策略 %{y:.4f}<extra></extra>' },
+                { type: 'scatter', mode: 'lines', x: xs, y: bhSeries, text: dates,
+                  line: { color: '#9ca3af', width: 1.5 }, name: '买入持有',
+                  hovertemplate: '%{text}<br>基准 %{y:.4f}<extra></extra>' },
+            ];
+            this.paintNav(el, data, dates);
+        },
+    };
+}
+</script>
+
+{% endblock %}

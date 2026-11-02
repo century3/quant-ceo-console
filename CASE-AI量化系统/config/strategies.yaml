@@ -1,0 +1,18 @@
+# 实盘监控 -- 策略路由表 (由 /live 页面写入)
+# 修改后, 在页面点 '应用策略配置' 即可热加载, 无需重启
+# dragon_version: v1 对照 / v2 默认, 主循环 strat_dragon 入场跟这个走
+# MACD: macd_1d=日K(12/26/9); 另有 ma20_hold / multi_factor_top / dragon_picker / grid_classic / chan_buy1 / chan_buy2 / chan_buy3 / chan_buy2_ml / ml_xgb / ml_lgb
+
+default: macd_1d
+per_stock:
+  688126.SH: macd_1d
+  601788.SH: macd_1d
+  000612.SZ: macd_1d
+  513100.SH: macd_1d
+  COHR.US: boll_revert
+  GOOG.US: macd_1d
+  IPSC.US: macd_1d
+  NVDA.US: macd_1d
+  RKLB.US: macd_1d
+  VOO.US: macd_1d
+dragon_version: v2

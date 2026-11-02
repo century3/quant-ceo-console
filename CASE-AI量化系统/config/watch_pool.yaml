@@ -1,0 +1,14 @@
+# 监控代码列表 -- 与 mock 持仓、per_stock 合并为最终监控列表 (去重)
+# 也可通过页面「添加股票并绑定策略」写入
+
+codes:
+- 688126.SH
+- 601788.SH
+- 000612.SZ
+- 513100.SH
+- COHR.US
+- GOOG.US
+- IPSC.US
+- NVDA.US
+- RKLB.US
+- VOO.US

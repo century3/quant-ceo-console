@@ -1,0 +1,7 @@
+{
+  "total_chunks": 18,
+  "embedding_model": "text-embedding-v4",
+  "chunk_size": 800,
+  "chunk_overlap": 150,
+  "pages_mapped": 18
+}

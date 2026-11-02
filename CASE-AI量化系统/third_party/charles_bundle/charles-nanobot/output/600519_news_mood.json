@@ -1,0 +1,22 @@
+{
+  "overall_sentiment": "乐观",
+  "fear_greed_index": 75,
+  "positive_count": 8,
+  "negative_count": 1,
+  "neutral_count": 2,
+  "top_themes": [
+    "贵州茅台业绩表现",
+    "上市公司分红能力",
+    "白酒行业动态"
+  ],
+  "risk_alerts": [
+    "五大白酒龙头多数业绩下滑",
+    "五粮液年报延期引发关注"
+  ],
+  "opportunity_hints": [
+    "关注贵州茅台的持续增长潜力",
+    "寻找高分红的优质上市公司",
+    "留意白酒行业调整中的机会"
+  ],
+  "summary": "整体市场情绪偏乐观，贵州茅台和多家公司表现强劲，但需关注白酒行业部分企业业绩下滑风险。"
+}

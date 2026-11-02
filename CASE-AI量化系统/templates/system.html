@@ -1,0 +1,133 @@
+{% extends "base.html" %}
+{% block title %}系统状态 -- AI 量化系统{% endblock %}
+
+{% block content %}
+<div x-data="systemApp()" x-init="init()">
+
+    <button class="help-btn-floating" @click="showHelp = true" title="使用说明">?</button>
+
+    <!-- 使用说明 modal -->
+    <div class="modal-overlay" x-show="showHelp" x-cloak @click.self="showHelp = false">
+        <div class="modal-card">
+            <div class="modal-header">
+                <div class="modal-title">系统状态 -- 使用说明</div>
+                <button class="modal-close" @click="showHelp = false">×</button>
+            </div>
+            <div class="modal-body">
+                <h4>这个 Tab 是干嘛的</h4>
+                <p>系统级运维面板, 一眼看出"哪个组件挂了"。还有标准 cron 时点参考。</p>
+
+                <h4>健康检查 7 项</h4>
+                <ul>
+                    <li><b>Python 版本</b> -- 运行环境</li>
+                    <li><b>xtdata 行情</b> -- 是否能拉到 K 线/tick</li>
+                    <li><b>DASHSCOPE_API_KEY</b> -- Charles 投研对话能不能用</li>
+                    <li><b>QMT_PATH</b> -- 实盘下单路径 (默认 dry-run 不需要)</li>
+                    <li><b>live_state.json</b> -- 实盘 state 文件</li>
+                    <li><b>strategy_registry.json</b> -- 策略库</li>
+                    <li><b>历史晨报</b> -- 累积了多少份</li>
+                </ul>
+
+                <h4>定时任务</h4>
+                <p>实盘工作台默认 3 个时点 (周一到周五):</p>
+                <ul>
+                    <li><code>08:30</code> 数据增量（根目录 <code>.env</code> 中 <code>CASE_A_BOARD_DATA_PREP_DIR</code> 下的 <code>run_daily.py</code>）</li>
+                    <li><code>09:30</code> 开盘启动 dry-run 主循环</li>
+                    <li><code>14:55</code> 收盘前 5 分钟停主循环</li>
+                </ul>
+                <p class="text-xs text-gray-500">
+                    实现见 <code>scheduler.py</code>（APScheduler + cron）。
+                    跟 web 分进程跑: <code>python scheduler.py</code>.
+                </p>
+
+                <h4>典型场景</h4>
+                <div class="example-block">
+                    <b>场景 1 (排错)</b>: 投研对话不出回复 → 查"DASHSCOPE_API_KEY" 是不是 OK<br/><br/>
+                    <b>场景 2 (上线前自检)</b>: 启动 cron 调度前先点"健康检查", 全 OK 再跑
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="grid-2">
+        <!-- 健康检查 -->
+        <div class="card">
+            <div class="card-header">
+                <div class="card-title">健康检查</div>
+                <button class="btn btn-primary btn-sm" @click="check()" :disabled="checking">
+                    <span x-show="!checking">健康检查</span>
+                    <span x-show="checking">检查中...</span>
+                </button>
+            </div>
+            <template x-if="!health || health.length === 0">
+                <div class="text-gray-400 text-sm py-6 text-center">点右上按钮跑一次</div>
+            </template>
+            <template x-if="health && health.length > 0">
+                <table class="app-table">
+                    <thead><tr><th>项</th><th>值</th><th>状态</th></tr></thead>
+                    <tbody>
+                        <template x-for="r in health" :key="r.item">
+                            <tr>
+                                <td x-text="r.item"></td>
+                                <td class="text-xs text-gray-600 font-mono" x-text="r.value"></td>
+                                <td>
+                                    <span class="badge"
+                                          :class="r.status === 'OK' ? 'badge-success' :
+                                                  r.status === 'WARN' ? 'badge-warning' : 'badge-danger'"
+                                          x-text="r.status"></span>
+                                </td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+            </template>
+        </div>
+
+        <!-- 定时任务 cron -->
+        <div class="card">
+            <div class="card-header">
+                <div class="card-title">定时任务</div>
+                <div class="card-subtitle">实盘工作台默认 3 个时点</div>
+            </div>
+            <table class="app-table">
+                <thead><tr>
+                    <th>时间</th><th>动作</th><th>说明</th>
+                </tr></thead>
+                <tbody>
+                    <tr><td class="num">08:30</td><td>数据增量</td>
+                        <td>按 <code>CASE_A_BOARD_DATA_PREP_DIR</code> 调用 <code>run_daily.py</code> 拉昨日 K 线 + 板块指数</td></tr>
+                    <tr><td class="num">09:30</td><td>启动主循环</td>
+                        <td>开盘启动 dry-run 模拟盘 (每分钟巡检一次)</td></tr>
+                    <tr><td class="num">14:55</td><td>停止主循环</td>
+                        <td>收盘前 5 分钟停, 避免空转</td></tr>
+                </tbody>
+            </table>
+            <div class="text-xs text-gray-500 mt-3 leading-relaxed">
+                <b>启动方法</b> (跟 web 工作台分两个进程跑, 互不影响):<br/>
+                <code class="text-xs" style="color:#7c3aed;">
+                    cd 22-实盘作战与CEO控制台\CASE-AI量化系统<br/>
+                    python scheduler.py
+                </code><br/>
+                <span class="text-gray-400">单文件 APScheduler，周一到周五自动触发，Ctrl+C 退出；想立刻验证可加 <code>--simulate</code>。</span>
+            </div>
+        </div>
+    </div>
+
+</div>
+
+<script>
+function systemApp() {
+    return {
+        showHelp: false,
+        health: null,
+        checking: false,
+        async init() { await this.check(); },
+        async check() {
+            this.checking = true;
+            this.health = await App.get('/api/system/health');
+            this.checking = false;
+        },
+    }
+}
+</script>
+{% endblock %}

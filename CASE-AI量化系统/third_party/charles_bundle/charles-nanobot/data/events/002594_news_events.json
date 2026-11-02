@@ -1,0 +1,23 @@
+{
+  "summary": {
+    "total_news": 8,
+    "events_detected": 1,
+    "bullish_events": 0,
+    "bearish_events": 0,
+    "policy_events": 1
+  },
+  "events": [
+    {
+      "news_index": 1,
+      "news_preview": "人民财讯3月27日电，比亚迪0025943月27日公告，公司及公司控股子公司拟使用自有闲置资金在银行、证券公司、基金公司、保险资产管理公司等金融机构购买安全性高、流动性好、中低风险的理财产品或债券产品，资金总额不超过人民币600亿元，授权使用期限自董事会审议通过之日起12个月内 比亚迪：拟使用不超6",
+      "detection_method": "keyword",
+      "event_type": "政策",
+      "event_category": "货币政策",
+      "matched_keywords": [
+        "流动性"
+      ],
+      "signal": "关注宏观",
+      "signal_reason": "影响市场整体流动性"
+    }
+  ]
+}

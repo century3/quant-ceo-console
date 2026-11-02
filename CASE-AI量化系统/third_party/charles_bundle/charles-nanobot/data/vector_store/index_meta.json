@@ -1,0 +1,12 @@
+{
+  "total_chunks": 860,
+  "total_documents": 11,
+  "embedding_model": "text-embedding-v4",
+  "chunk_size": 800,
+  "chunk_overlap": 150,
+  "stock_codes": [
+    "600519",
+    "688981"
+  ],
+  "built_at": "2026-04-02 15:26:48"
+}

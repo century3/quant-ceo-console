@@ -1,0 +1,19 @@
+# 行情与交易（复用 21 章）
+xtquant
+pandas>=2.0.0
+numpy>=1.24.0
+
+# 调度
+apscheduler>=3.10.0
+chinese-calendar>=1.10.0
+
+# CEO 控制台 (Gradio)
+gradio>=4.0.0
+plotly>=5.0.0     # 净值曲线 / 持仓饼图
+
+# 推送
+requests>=2.31.0
+
+# 工具
+python-dotenv>=1.0.0
+pyyaml>=6.0

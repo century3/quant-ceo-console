@@ -1,0 +1,22 @@
+{
+  "overall_sentiment": "乐观",
+  "fear_greed_index": 75,
+  "positive_count": 5,
+  "negative_count": 2,
+  "neutral_count": 3,
+  "top_themes": [
+    "中芯国际业绩增长",
+    "电子板块资金流入",
+    "科创板股票交易"
+  ],
+  "risk_alerts": [
+    "主力资金连续净流出",
+    "电子行业资金净流出"
+  ],
+  "opportunity_hints": [
+    "关注中芯国际相关股票",
+    "关注电子板块资金动向",
+    "关注科创板股票表现"
+  ],
+  "summary": "市场情绪整体偏乐观，中芯国际业绩增长和电子板块资金流入是主要支撑。"
+}
