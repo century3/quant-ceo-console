@@ -25,7 +25,12 @@ CASE-AI量化系统/third_party/charles_bundle/charles-nanobot/cohr_daily.csv
 CASE-AI量化系统/third_party/charles_bundle/charles-nanobot/cohr_ta.csv
 CASE-AI量化系统/third_party/charles_bundle/charles-nanobot/cohr_raw.json
 
-# 第三方研报、财报原文和课件 PDF
+# 第三方研报、财报原文、解析文本和课件 PDF
 *.pdf
 CASE-AI量化系统/third_party/charles_bundle/charles-nanobot/data/reports/
 CASE-AI量化系统/third_party/charles_bundle/charles-nanobot/data/financial_reports/
+CASE-AI量化系统/third_party/charles_bundle/charles-nanobot/data/parsed/
+CASE-AI量化系统/third_party/charles_bundle/charles-nanobot/data/parsed_ocr/
+CASE-AI量化系统/third_party/charles_bundle/charles-nanobot/data/vector_db/
+CASE-AI量化系统/third_party/charles_bundle/charles-nanobot/data/vector_store/
+CASE-AI量化系统/third_party/charles_bundle/charles-nanobot/data/documents.db
