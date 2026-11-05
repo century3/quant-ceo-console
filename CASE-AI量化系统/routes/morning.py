@@ -8,8 +8,10 @@ GET  /api/morning/stream?...    -- SSE 流式跑工作流, 推送进度
 
 from __future__ import annotations
 import asyncio
+import importlib
 import json
 import queue
+import sys
 import threading
 import time
 from datetime import datetime
@@ -17,8 +19,15 @@ from datetime import datetime
 from fastapi import APIRouter, Query
 from sse_starlette.sse import EventSourceResponse
 
-from lib.paths import setup_sys_path, OUTPUTS_DIR
+from lib.paths import setup_sys_path, OUTPUTS_DIR, PROJECT_ROOT
 setup_sys_path()
+
+# 晨会分析直接跑 21 目录的最新工作流，不再用本项目里的 morning_brief 副本
+CASE_D_DIR = (
+    PROJECT_ROOT.parents[1]
+    / "21-投资晨会-人机协作"
+    / "CASE-D-投资晨会工作流"
+)
 
 router = APIRouter()
 
@@ -88,6 +97,39 @@ NODE_EST = {
 NODE_ORDER = ["industry", "stock_picker", "report", "push"]
 
 
+class _SafeStream:
+    """控制台窗口关掉后，print 会抛 OSError 22。晨会日志写失败时丢掉，不中断计算。"""
+
+    def __init__(self, raw):
+        self._raw = raw
+
+    def write(self, data):
+        try:
+            return self._raw.write(data)
+        except OSError:
+            return 0
+
+    def flush(self):
+        try:
+            self._raw.flush()
+        except OSError:
+            return None
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
+
+
+def _prepend_case_d() -> None:
+    """让 import graph / graph_us 命中 21 目录，而不是别的同名模块。"""
+    if not (CASE_D_DIR / "graph.py").is_file():
+        raise FileNotFoundError(f"找不到晨会代码: {CASE_D_DIR}")
+    for folder in (CASE_D_DIR, CASE_D_DIR / "lib"):
+        folder_s = str(folder)
+        if folder_s in sys.path:
+            sys.path.remove(folder_s)
+        sys.path.insert(0, folder_s)
+
+
 @router.get("/stream")
 async def stream(
     top_industries: int = Query(3),
@@ -120,14 +162,24 @@ async def stream(
     chunk_queue: "queue.Queue" = queue.Queue()
 
     def worker():
+        # graph.py 会把 CASE-D 插到 sys.path 最前。跑完恢复，避免盖住龙头策略的 db_config
+        saved_path = list(sys.path)
+        saved_out, saved_err = sys.stdout, sys.stderr
+        sys.stdout = _SafeStream(saved_out)
+        sys.stderr = _SafeStream(saved_err)
         try:
-            from morning_brief.graph import build_graph
-            graph = build_graph()
+            _prepend_case_d()
+            mod_name = "graph_us" if market == "us" else "graph"
+            graph = importlib.import_module(mod_name).build_graph()
             for chunk in graph.stream(initial_state, stream_mode="updates"):
                 chunk_queue.put(("update", chunk))
             chunk_queue.put(("done", None))
         except Exception as e:
             chunk_queue.put(("error", e))
+        finally:
+            sys.stdout = saved_out
+            sys.stderr = saved_err
+            sys.path[:] = saved_path
 
     th = threading.Thread(target=worker, daemon=True)
     th.start()

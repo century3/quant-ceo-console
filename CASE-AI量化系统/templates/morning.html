@@ -15,15 +15,13 @@
             </div>
             <div class="modal-body">
                 <h4>数据从哪来</h4>
-                <p>本页只做<strong>读 MySQL（wucai_trade）</strong>上的分析与打分，不在此拉行情。
-                A 股用 <code>trade_sector_daily</code>、<code>trade_stock_daily</code>、<code>trade_stock_status</code>。
-                美股用 <code>trade_stock_us_daily</code>，板块来自采集脚本里的行业分组，等权合成指数后再打分。</p>
+                <p>本页调用 <code>21-投资晨会-人机协作/CASE-D-投资晨会工作流</code>，只读 MySQL（wucai_trade），不在此拉行情。
+                A 股走 <code>graph.py</code>，用 <code>trade_sector_daily</code>、<code>trade_stock_daily</code>、<code>trade_stock_status</code>。
+                美股走 <code>graph_us.py</code>，用 <code>trade_sector_us_daily</code>、<code>trade_stock_us_daily</code>、<code>trade_stock_us_status</code>。</p>
 
                 <h4>库数据更新（单独跑，较慢）</h4>
-                <p>在根目录 <code>.env</code> 中配置 <code>CASE_A_BOARD_DATA_PREP_DIR</code>，指向含
-                <code>run_daily.py</code> 的数据准备目录（与 <code>scheduler.py</code> 相同）。
-                进入该目录执行 <code>python run_daily.py</code> 做 K 线与板块指数增量同步；
-                首次全量请按数据准备目录自带的说明执行。</p>
+                <p>在数据准备目录执行 <code>python run_daily.py</code> 更新 A 股，
+                <code>python run_daily_us.py</code> 更新美股。本页只消费库里已经算好的板块指数和日 K。</p>
 
                 <h4>分析流水线（4 节点）</h4>
                 <ol>

@@ -673,6 +673,13 @@ class LiveSimRunner:
         if self._thread is not None and self._thread.is_alive():
             return "[INFO] 模拟盘已在运行, 请先停止"
 
+        # 回放信号前先补美股日K，否则金叉死叉停在库里的最后一根
+        try:
+            from lib.us_daily_sync import sync_watch_us_daily
+            sync_watch_us_daily(watch_stocks)
+        except Exception as e:
+            print(f"[us] 启动补齐美股日K失败 (不影响模拟盘启动): {type(e).__name__}: {e}", flush=True)
+
         from lib.paths import OUTPUTS_LIVE_STATE, setup_sys_path
         setup_sys_path()
         from live_trading.live_loop import LiveTradingLoop
