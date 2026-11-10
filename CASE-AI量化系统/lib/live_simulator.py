@@ -761,10 +761,21 @@ class LiveSimRunner:
 
         def worker():
             while not self._stop_flag:
+                # 一键清仓不等开盘，A 股和美股一起平
+                cleared = False
+                try:
+                    if self._loop.consume_force_clear():
+                        cleared = True
+                        self._cycle_count += 1
+                        self._last_cycle_at = datetime.now().strftime("%H:%M:%S") + " (一键清仓)"
+                        self._last_error = None
+                except Exception as e:
+                    self._last_error = f"{type(e).__name__}: {e}"
                 # A 股白天、美股美东白天各自轮询。两边都收盘才整轮跳过。
                 active = [c for c in self._loop.watch_stocks if market_is_open(c)]
                 if not active:
-                    self._last_cycle_at = datetime.now().strftime("%H:%M:%S") + " (非盘中, 跳过)"
+                    if not cleared:
+                        self._last_cycle_at = datetime.now().strftime("%H:%M:%S") + " (非盘中, 跳过)"
                 else:
                     try:
                         self._loop.run_once(active)

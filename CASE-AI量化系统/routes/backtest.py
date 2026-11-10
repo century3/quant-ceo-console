@@ -75,6 +75,18 @@ def _normalize_code(code: str) -> str:
     return s
 
 
+def _refresh_us_daily(code: str) -> str:
+    """美股回测前先把这一只的日 K 写入库。失败则不回测。"""
+    if not str(code).upper().endswith(".US"):
+        return ""
+    from lib.backtest_data import clear_kline_cache
+    from lib.us_daily_sync import sync_one_us_daily
+
+    message = sync_one_us_daily(code)
+    clear_kline_cache()
+    return message
+
+
 def _resolve_code_or_error(raw: str) -> Dict[str, Any]:
     """解析 code/名称; 成功返回 {ok, code, name}, 失败返回带 candidates 的错误."""
     from lib.backtest_data import resolve_stock_query, search_stocks
@@ -174,6 +186,11 @@ def backtest_run(payload: Optional[Dict[str, Any]] = Body(None)):
     position_pct = payload.get("position_pct")
 
     try:
+        data_note = _refresh_us_daily(code)
+    except Exception as e:
+        return {"ok": False, "message": f"日K采集失败，未开始回测: {type(e).__name__}: {e}"}
+
+    try:
         result = run_backtest(
             stock_code=code,
             strategy_name=strategy,
@@ -185,6 +202,8 @@ def backtest_run(payload: Optional[Dict[str, Any]] = Body(None)):
         )
     except Exception as e:
         result = {"ok": False, "message": f"{type(e).__name__}: {e}"}
+    if data_note and result.get("ok"):
+        result["data_note"] = data_note
     return _with_shared_tip(result)
 
 
@@ -215,6 +234,11 @@ def backtest_recommend(payload: Optional[Dict[str, Any]] = Body(None)):
     position_pct = payload.get("position_pct")
 
     try:
+        data_note = _refresh_us_daily(code)
+    except Exception as e:
+        return {"ok": False, "message": f"日K采集失败，未开始回测: {type(e).__name__}: {e}"}
+
+    try:
         result = score_strategies(
             stock_code=code,
             start_date=start,
@@ -226,6 +250,8 @@ def backtest_recommend(payload: Optional[Dict[str, Any]] = Body(None)):
         )
     except Exception as e:
         result = {"ok": False, "message": f"{type(e).__name__}: {e}"}
+    if data_note and result.get("ok"):
+        result["data_note"] = data_note
     return _with_shared_tip(result)
 
 

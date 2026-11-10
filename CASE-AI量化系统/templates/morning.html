@@ -15,13 +15,12 @@
             </div>
             <div class="modal-body">
                 <h4>数据从哪来</h4>
-                <p>本页调用 <code>21-投资晨会-人机协作/CASE-D-投资晨会工作流</code>，只读 MySQL（wucai_trade），不在此拉行情。
-                A 股走 <code>graph.py</code>，用 <code>trade_sector_daily</code>、<code>trade_stock_daily</code>、<code>trade_stock_status</code>。
-                美股走 <code>graph_us.py</code>，用 <code>trade_sector_us_daily</code>、<code>trade_stock_us_daily</code>、<code>trade_stock_us_status</code>。</p>
+                <p>本页调用 <code>21-投资晨会-人机协作/CASE-D-投资晨会工作流</code>。
+                A 股走 <code>graph.py</code>，只读 <code>trade_sector_daily</code>、<code>trade_stock_daily</code>、<code>trade_stock_status</code>。
+                美股走 <code>graph_us.py</code>，读 <code>trade_sector_us_daily</code>、<code>trade_stock_us_daily</code>、<code>trade_stock_us_status</code>。点一键触发时，美股会先跑 <code>run_daily_us.py</code>：续拉 Yahoo 日 K，再重算最近 120 个交易日的板块指数。</p>
 
-                <h4>库数据更新（单独跑，较慢）</h4>
-                <p>在数据准备目录执行 <code>python run_daily.py</code> 更新 A 股，
-                <code>python run_daily_us.py</code> 更新美股。本页只消费库里已经算好的板块指数和日 K。</p>
+                <h4>库数据更新</h4>
+                <p>A 股仍要在数据准备目录执行 <code>python run_daily.py</code>。美股由本页一键触发代跑 <code>python run_daily_us.py</code>。</p>
 
                 <h4>分析流水线（4 节点）</h4>
                 <ol>
@@ -33,7 +32,7 @@
 
                 <h4>操作</h4>
                 <ul>
-                    <li><b>一键触发晨会</b>：只做上述分析（耗时主要取决于库内数据量与 Top 板块数量）</li>
+                    <li><b>一键触发晨会</b>：美股先采集再分析；A 股直接分析。耗时主要取决于采集和库内数据量</li>
                     <li><b>用最近缓存</b>：读上次结果，不重新跑分析</li>
                 </ul>
             </div>

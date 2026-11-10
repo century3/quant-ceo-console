@@ -52,32 +52,45 @@ def _us_codes(codes) -> list[str]:
     return out
 
 
+def _last_trade_date(mod, stock_code: str):
+    rows = mod.execute_query(
+        f"SELECT MAX(trade_date) AS d FROM {mod.US_TABLE} WHERE stock_code = %s",
+        (stock_code,),
+    )
+    last = rows[0]["d"] if rows else None
+    if hasattr(last, "date"):
+        last = last.date()
+    return last
+
+
+def sync_one_us_daily(stock_code: str) -> str:
+    """把一只美股日 K 续到今天。Yahoo 没写下数据时抛错。"""
+    code = str(stock_code or "").strip().upper()
+    if not code.endswith(".US"):
+        raise ValueError(f"不是美股代码: {stock_code}")
+    mod = _load_yahoo()
+    mod.execute_update(mod.CREATE_TABLE_SQL)
+    today = date.today()
+    end = today + timedelta(days=1)
+    last = _last_trade_date(mod, code)
+    start = last or (today - timedelta(days=365 * _HISTORY_YEARS))
+    if start > today:
+        return f"{code} 日K已到 {start}"
+    ok = bool(mod.save_symbol(_yahoo_symbol(code), code, start, end))
+    if not ok:
+        raise RuntimeError(f"{code} 没有采集到日K")
+    latest = _last_trade_date(mod, code)
+    return f"{code} 日K已更新到 {latest}"
+
+
 def sync_watch_us_daily(codes) -> None:
     """把监控池中的 .US 代码补到今天。已有数据从最后一根续，没有的拉近 5 年。"""
     us_codes = _us_codes(codes)
     if not us_codes:
         return
-    mod = _load_yahoo()
-    mod.execute_update(mod.CREATE_TABLE_SQL)
-    today = date.today()
-    end = today + timedelta(days=1)
     print(f"[us] 启动补齐美股日K {len(us_codes)} 只", flush=True)
     for code in us_codes:
-        rows = mod.execute_query(
-            f"SELECT MAX(trade_date) AS d FROM {mod.US_TABLE} WHERE stock_code = %s",
-            (code,),
-        )
-        last = (rows[0]["d"] if rows else None)
-        if hasattr(last, "date"):
-            last = last.date()
-        start = last or (today - timedelta(days=365 * _HISTORY_YEARS))
-        if start > today:
-            print(f"[us] {code} 已到 {start}，跳过", flush=True)
-            continue
         try:
-            ok = bool(mod.save_symbol(_yahoo_symbol(code), code, start, end))
+            print(f"[us] {sync_one_us_daily(code)}", flush=True)
         except Exception as exc:
             print(f"[us] {code} 采集失败: {type(exc).__name__}: {exc}", flush=True)
-            continue
-        if not ok:
-            print(f"[us] {code} 没有写入新K线", flush=True)

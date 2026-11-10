@@ -21,6 +21,7 @@ DATA_DIR            = PROJECT_ROOT / "data"
 # 关键产出
 OUTPUTS_LIVE_STATE = OUTPUTS_DIR / "live_state.json"
 OUTPUTS_RESEARCH   = MORNING_BRIEF_DIR / "outputs" / "reports"
+OUTPUTS_EVOLVE_REGISTRY = OUTPUTS_DIR / "strategy_registry.json"
 
 # 全项目唯一环境变量文件
 ENV_FILE = PROJECT_ROOT / ".env"

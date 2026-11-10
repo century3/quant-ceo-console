@@ -15,12 +15,10 @@ URL 结构:
     /morning     -- 晨会分析 HTML (读库)
     /live        -- 实盘监控 HTML
     /backtest    -- 回测 HTML
+    /review      -- 复盘归因 HTML (Brinson + Walk-Forward + 生命周期)
     /system      -- 系统状态 HTML
     /api/*       -- REST API
     /static/*    -- 静态资源 (CSS/JS)
-说明:
-    后续可加 /review（复盘归因）等路由。
-    当前实现: /live, /chat, /morning, /backtest, /system。
 
 启动:
     python app.py        -- 默认 7865 端口
@@ -51,7 +49,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import RedirectResponse, HTMLResponse
 
-from routes import morning, live, system as sys_route, backtest, dragon, holdings_news
+from routes import morning, live, review, system as sys_route, backtest, dragon, holdings_news
 from routes.live import _SIM as _LIVE_SIM
 from lib.live_simulator import merge_watch_codes
 
@@ -96,6 +94,7 @@ api.include_router(holdings_news.router, prefix="/api/holdings-news", tags=["hol
 api.include_router(live.router,      prefix="/api/live",     tags=["live"])
 api.include_router(sys_route.router, prefix="/api/system",   tags=["system"])
 api.include_router(backtest.router,  prefix="/api/backtest", tags=["backtest"])
+api.include_router(review.router,    prefix="/api/review",   tags=["review"])
 api.include_router(dragon.router,    prefix="/api/dragon",   tags=["dragon"])
 
 
@@ -150,6 +149,13 @@ def page_live_real(request: Request):
 def page_backtest(request: Request):
     return templates.TemplateResponse("backtest.html",
                                       {"request": request, "active": "backtest"})
+
+
+@api.get("/review", response_class=HTMLResponse)
+def page_review(request: Request):
+    ctx = {"request": request, "active": "review"}
+    ctx.update(live.tool_ctx())
+    return templates.TemplateResponse("review.html", ctx)
 
 
 @api.get("/system", response_class=HTMLResponse)

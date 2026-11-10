@@ -39,7 +39,7 @@ from lib.live_simulator import (
     set_dragon_version,
 )
 from dragon_strategy.dragon_picker import (
-    filter_dragon_candidates, dragon_version_params,
+    filter_dragon_candidates, dragon_version_params, US_MAX_PRICE,
 )
 from dragon_strategy.dragon_backtest import (
     load_status_meta,
@@ -117,6 +117,98 @@ def _candidates_from_mysql_latest_day(
         top_k=top_k,
     )
     return cands, latest_str
+
+
+def _candidates_from_us_latest_day(
+    min_change: float, max_price: float, min_vol_ratio: float,
+    require_sector_resonance: bool, top_k: int,
+) -> Tuple[List[Dict[str, Any]], str]:
+    """从 trade_stock_us_daily 拉最近一个交易日的美股龙头候选。
+
+    口径与单票 _eval_dragon_us 相同: 量比用成交量, 板块用采集分组的等权涨幅。
+    不套流通市值、9.5% 涨停和上市天数。价格上限 400 美元。
+    """
+    import pandas as pd
+    from dragon_strategy.db_config import execute_query
+    from morning_brief.lib.rotation_runner import us_sector_asof
+    from lib.backtest_data import _us_display_names
+
+    days = execute_query(
+        """
+        SELECT DISTINCT trade_date FROM trade_stock_us_daily
+        WHERE close_price IS NOT NULL AND close_price > 0
+        ORDER BY trade_date DESC
+        LIMIT 7
+        """
+    )
+    if len(days) < 2:
+        raise RuntimeError("trade_stock_us_daily 不足两个交易日, 无法算涨幅和量比")
+    dates = [r["trade_date"] for r in days]
+    latest = pd.Timestamp(dates[0]).normalize()
+    latest_str = latest.strftime("%Y-%m-%d")
+    rows = execute_query(
+        """
+        SELECT stock_code, trade_date, close_price AS close, volume
+        FROM trade_stock_us_daily
+        WHERE trade_date IN ({placeholders})
+          AND close_price IS NOT NULL AND close_price > 0
+        """.format(placeholders=",".join(["%s"] * len(dates))),
+        dates,
+    )
+    if not rows:
+        raise RuntimeError(f"trade_stock_us_daily 在最近 7 个交易日没有收盘价")
+
+    panel = pd.DataFrame(rows)
+    panel["stock_code"] = panel["stock_code"].astype(str).str.strip().str.upper()
+    panel["trade_date"] = pd.to_datetime(panel["trade_date"]).dt.normalize()
+    panel["close"] = pd.to_numeric(panel["close"], errors="coerce")
+    panel["volume"] = pd.to_numeric(panel["volume"], errors="coerce").fillna(0)
+    today = panel[panel["trade_date"] == latest]
+    window = panel[panel["trade_date"] < latest]
+    if today.empty or window.empty:
+        raise RuntimeError(f"trade_stock_us_daily 在 {latest_str} 无法对齐前收")
+
+    vol5 = window.groupby("stock_code")["volume"].mean()
+    prev_close = window.sort_values("trade_date").groupby("stock_code")["close"].last()
+    names = _us_display_names()
+    raw: List[Dict[str, Any]] = []
+    for row in today.itertuples():
+        code = str(row.stock_code or "").strip().upper()
+        close_t = float(row.close or 0)
+        vol_t = float(row.volume or 0)
+        pc = float(prev_close.get(code, 0) or 0)
+        if not code or close_t <= 0 or pc <= 0:
+            continue
+        avg_vol = float(vol5.get(code, 0) or 0)
+        sector = us_sector_asof(code, latest)
+        raw.append({
+            "code": code,
+            "name": names.get(code) or code[:-3],
+            "sector_1": sector["sector"],
+            "sector_2": sector["sector"],
+            "day_change_pct": close_t / pc - 1.0,
+            "price": close_t,
+            "volume_ratio": vol_t / avg_vol if avg_vol > 0 else 0.0,
+            "float_market_cap": None,
+            "listed_days": None,
+            "sector_change_pct": sector["sector_change_pct"],
+            "sector_rise_ratio": sector["sector_rise_ratio"],
+            "penalize_limit_up": False,
+        })
+    if not raw:
+        raise RuntimeError(f"trade_stock_us_daily 在 {latest_str} 没有可计算涨幅的股票")
+
+    cands = filter_dragon_candidates(
+        raw,
+        min_change=min_change,
+        max_price=max_price,
+        min_volume_ratio=min_vol_ratio,
+        require_sector_resonance=require_sector_resonance,
+        max_change=1.0,
+        min_listed_days=0,
+        check_mcap=False,
+    )
+    return cands[:top_k], latest_str
 
 
 def _a_share_elapsed_minutes() -> int:
@@ -225,33 +317,70 @@ def _candidates_from_xtdata(min_change: float, max_price: float,
 
 @router.get("/candidates")
 def candidates(
-    source: str = Query("auto", description="auto / mysql / xtdata"),
+    market: str = Query("cn", description="cn=A股 / us=美股"),
+    source: str = Query("auto", description="auto / mysql / xtdata, 仅 A 股"),
     version: str = Query("v2", description="v1 对照 / v2 默认, 与课件回测同一套"),
     use_xtdata: int = Query(0, description="(旧) 1=等价 source=xtdata"),
     min_change: float = Query(0.05),
     max_price: float = Query(30.0),
     min_vol_ratio: float = Query(2.0),
     require_resonance: int = Query(-1,
-        description="板块共振: 1=开 0=关 -1=跟 version (v1 关; v2 时 mysql 开、QMT 关)"),
+        description="板块共振: 1=开 0=关 -1=跟 version (v1 关; v2 时 A股 mysql 开、QMT 关; 美股 v2 开)"),
 ):
     """返回龙头候选 (按 dragon_score 降序).
 
-    version=v2: 涨幅<9.5% + 上市>=60日 + 共振(仅 MySQL)
-    version=v1: 关共振 / 不限涨停 / 不限次新
-    source=auto: 先 mysql, 无候选再 QMT.
+    market=cn: A 股。v2 涨幅<9.5% + 上市>=60日 + 共振(仅 MySQL); v1 关共振。
+    market=us: 美股日 K。不套涨停、流通市值、上市天数; v2 仍要板块共振。
+    source=auto: 仅 A 股, 先 mysql, 无候选再 QMT.
     """
+    market = (market or "cn").strip().lower()
+    if market not in ("cn", "us"):
+        return {
+            "ok": False, "market": market, "source": source, "version": version,
+            "warning": "market 只能是 cn 或 us", "count": 0, "items": [],
+        }
     if use_xtdata == 1 and source == "auto":
         source = "xtdata"
     source = (source or "auto").lower()
     if source not in ("auto", "mysql", "xtdata"):
         source = "auto"
-    if not can_live_quote() and source != "mysql":
+    if market == "cn" and not can_live_quote() and source != "mysql":
         source = "mysql"
     version = (version or "").strip().lower()
     if version not in ("v1", "v2"):
         return {
-            "ok": False, "source": source, "version": version,
+            "ok": False, "market": market, "source": source, "version": version,
             "warning": "version 只能是 v1 或 v2", "count": 0, "items": [],
+        }
+    if market == "us":
+        res_on = False if require_resonance == 0 else True if require_resonance == 1 else version == "v2"
+        try:
+            cands, trade_date = _candidates_from_us_latest_day(
+                min_change=min_change, max_price=US_MAX_PRICE,
+                min_vol_ratio=min_vol_ratio,
+                require_sector_resonance=res_on, top_k=20,
+            )
+        except Exception as e:
+            return {
+                "ok": False, "market": "us", "source": "us_daily", "version": version,
+                "warning": f"us: {type(e).__name__}: {e}", "count": 0, "items": [],
+            }
+        return {
+            "ok": True,
+            "market": "us",
+            "source": "us_daily",
+            "version": version,
+            "trade_date": trade_date,
+            "warning": None,
+            "params": {
+                "min_change": min_change, "max_price": US_MAX_PRICE,
+                "min_vol_ratio": min_vol_ratio,
+                "max_change": 1.0, "min_listed_days": 0,
+                "require_sector_resonance": res_on,
+                "check_mcap": False,
+            },
+            "count": len(cands),
+            "items": cands,
         }
 
     # 与课件回测对照: v1 关共振+不限涨停+不限次新; v2 三条补丁全开
@@ -287,7 +416,7 @@ def candidates(
             err = f"mysql: {type(e).__name__}: {e}"
             if source == "mysql":
                 return {
-                    "ok": False, "source": "mysql", "version": version,
+                    "ok": False, "market": "cn", "source": "mysql", "version": version,
                     "warning": err, "count": 0, "items": [],
                 }
             cands = []
@@ -310,12 +439,13 @@ def candidates(
             err = (err + " | " + xt_err) if err else xt_err
             if source == "xtdata":
                 return {
-                    "ok": False, "source": "xtdata", "version": version,
+                    "ok": False, "market": "cn", "source": "xtdata", "version": version,
                     "warning": err, "count": 0, "items": [],
                 }
 
     return {
         "ok":         True,
+        "market":     "cn",
         "source":     used_source,
         "version":    version,
         "trade_date": trade_date,

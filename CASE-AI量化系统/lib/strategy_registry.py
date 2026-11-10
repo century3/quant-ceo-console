@@ -333,10 +333,11 @@ def _eval_dragon_us(code: str, version: str, day_change: float, vol_ratio: float
     """美股龙头。日K和分组都来自 trade_stock_us_daily。
 
     不套 A 股的流通市值、涨停 9.5% 和上市天数: 库里没有流通股本和上市日期,
-    也没有涨停。价格上限按 30 美元。v2 仍要求分组等权涨幅和上涨家数占比达标。
+    也没有涨停。价格上限按 400 美元。v2 仍要求分组等权涨幅和上涨家数占比达标。
     """
     from dragon_strategy.dragon_picker import (
         calc_dragon_score, filter_dragon_candidates, dragon_version_params,
+        US_MAX_PRICE,
     )
     from morning_brief.lib.rotation_runner import us_sector_asof
 
@@ -358,6 +359,7 @@ def _eval_dragon_us(code: str, version: str, day_change: float, vol_ratio: float
     }
     passed = filter_dragon_candidates(
         [snap],
+        max_price=US_MAX_PRICE,
         require_sector_resonance=params["require_sector_resonance"],
         max_change=1.0,
         min_listed_days=0,
@@ -461,9 +463,9 @@ def _eval_dragon(code: str, market, capital: float, version: str) -> dict:
     name="dragon_picker_v1",
     label="龙头首板战法 v1",
     group="龙头动量",
-    description="v1 五法则对照: 涨幅>5%、价<30、市值 30–500 亿、量比>2、非 ST。不限涨停/次新/共振。美股价<30美元, 不套市值。",
+    description="v1 五法则对照: 涨幅>5%、价<30、市值 30–500 亿、量比>2、非 ST。不限涨停/次新/共振。美股价<400美元, 不套市值。",
     scenario="对照课件五法则, 或想看涨停板/次新会不会混进来时。",
-    rules="入场：涨幅>5%、价<30、流通市值 30–500 亿、量比>2、非 ST。不限涨停、次新、板块共振。出场：当日跌幅>3% 或从当日最高回撤>3%。美股日K来自 trade_stock_us_daily，板块用采集分组的等权涨幅；价格上限 30 美元，不设流通市值，涨幅超过 9% 不减分。",
+    rules="入场：涨幅>5%、价<30、流通市值 30–500 亿、量比>2、非 ST。不限涨停、次新、板块共振。出场：当日跌幅>3% 或从当日最高回撤>3%。美股日K来自 trade_stock_us_daily，板块用采集分组的等权涨幅；价格上限 400 美元，不设流通市值，涨幅超过 9% 不减分。",
     example="一只票涨 7%、量比 4、价 12、市值 80 亿 -> 买入；从当日高点回撤超过 3% -> 卖出。",
 )
 def strat_dragon_v1(code: str, market, capital: float) -> dict:
@@ -476,7 +478,7 @@ def strat_dragon_v1(code: str, market, capital: float) -> dict:
     group="龙头动量",
     description="v2 硬过滤: 涨幅 5%–9.5%、价<30、市值 30–500 亿、量比>2、非 ST、上市≥60 日、板块共振。美股不套涨停、上市天数和市值。",
     scenario="关注当日强势、放量上攻的短线博弈，愿意承担较大波动时。",
-    rules="入场：涨幅 5%–9.5%、价<30、流通市值 30–500 亿、量比>2、非 ST、上市≥60 日、板块共振。出场：当日跌幅>3% 或从当日最高回撤>3%。美股板块用采集分组，涨幅不低于 0.5% 且上涨家数占比不低于 40% 才买；不套 9.5% 涨停上限、60 日上市和流通市值，价格上限 30 美元。",
+    rules="入场：涨幅 5%–9.5%、价<30、流通市值 30–500 亿、量比>2、非 ST、上市≥60 日、板块共振。出场：当日跌幅>3% 或从当日最高回撤>3%。美股板块用采集分组，涨幅不低于 0.5% 且上涨家数占比不低于 40% 才买；不套 9.5% 涨停上限、60 日上市和流通市值，价格上限 400 美元。",
     example="一只票涨 7%、量比 4、价 12、市值 80 亿、板块涨 2% 且涨家过半 -> 买入；从当日高点回撤超过 3% -> 卖出。",
 )
 def strat_dragon_v2(code: str, market, capital: float) -> dict:

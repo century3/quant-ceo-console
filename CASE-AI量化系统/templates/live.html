@@ -1122,11 +1122,11 @@
                     <div class="flex items-start gap-2">
                         <span class="badge badge-warning risk-tag">风控</span>
                         <span>已分档才开仓，金额 = 总资金 ÷ 档数
-                            （当前 <b x-text="slotAmountText()"></b>），整手; 卖掉档还在; 涨过目标不减仓</span>
+                            （当前 <b x-text="slotAmountText()"></b>）。A 股 100 股一手，美股 1 股。卖掉档还在; 涨过目标不减仓</span>
                     </div>
                     <div class="flex items-start gap-2">
                         <span class="badge badge-danger risk-tag">熔断</span>
-                        <span>当日亏损 ≤ -2% 自动 HALTED</span>
+                        <span>全部持仓浮动盈亏 ≤ -2% 自动 HALTED，含美股。A 股按人民币、美股按美元面额加总</span>
                     </div>
                     <div class="flex items-start gap-2">
                         <span class="badge badge-success risk-tag">下单</span>
@@ -1151,25 +1151,42 @@
                 </div>
                 <div x-show="dragon.show" x-cloak class="mt-3" x-transition>
                     <div class="text-xs text-gray-600 mb-2 leading-relaxed">
-                        <template x-if="dragon.versionMode === 'v2'">
+                        <template x-if="dragon.marketMode === 'us' && dragon.versionMode === 'v2'">
+                            <div><b>美股 v2</b>：日 K 涨幅&gt;5%、价&lt;400 美元、量比&gt;2。不套涨停、流通市值、上市天数。板块用采集分组，涨幅不低于 0.5% 且上涨家数占比不低于 40%。</div>
+                        </template>
+                        <template x-if="dragon.marketMode === 'us' && dragon.versionMode === 'v1'">
+                            <div><b>美股 v1</b>：日 K 涨幅&gt;5%、榜前 50、价&lt;400 美元、量比&gt;2。不套涨停、流通市值、上市天数和板块共振。</div>
+                        </template>
+                        <template x-if="dragon.marketMode !== 'us' && dragon.versionMode === 'v2'">
                             <div><b>选股 v2</b>：涨幅 5%–9.5%、价&lt;30、市值 30–500 亿、量比&gt;2、非 ST、上市≥60 日；MySQL 开板块共振，QMT 盘中无板块故共振关。</div>
                         </template>
-                        <template x-if="dragon.versionMode === 'v1'">
+                        <template x-if="dragon.marketMode !== 'us' && dragon.versionMode === 'v1'">
                             <div><b>选股 v1</b>：涨幅&gt;5%、榜前 50、市值 30–500 亿、量比&gt;2、非 ST、价&lt;30。不限涨停、次新、共振。</div>
                         </template>
                         <div class="mt-1"><b>战法</b>：一键加入监控后绑「龙头首板战法 v1/v2」，入场跟上面选股同一套硬过滤（不是龙头分≥1.5）。出场：当日跌幅&gt;3% 或从最高回撤&gt;3%。持仓策略列可再单独改。</div>
                     </div>
                     <div class="text-xs mb-2 text-gray-500">
-                        <template x-if="dragon.sourceMode === 'mysql'">
+                        <template x-if="dragon.marketMode === 'us'">
+                            <span>数据源: <b>美股日K</b> trade_stock_us_daily 最近一个交易日</span>
+                        </template>
+                        <template x-if="dragon.marketMode !== 'us' && dragon.sourceMode === 'mysql'">
                             <span>数据源: <b>MySQL</b> 最近一个真实交易日</span>
                         </template>
-                        <template x-if="dragon.sourceMode === 'xtdata'">
+                        <template x-if="dragon.marketMode !== 'us' && dragon.sourceMode === 'xtdata'">
                             <span>数据源: <b>QMT</b> 实时盘中</span>
                         </template>
                         <span> · 版本 <b x-text="(dragon.versionMode || 'v2').toUpperCase()"></b></span>
                     </div>
                     <div class="flex items-center gap-2 mb-2 flex-wrap">
                         <label class="text-xs text-gray-600 flex items-center gap-1">
+                            市场
+                            <select class="form-input" style="font-size:12px;padding:2px 6px;height:auto;"
+                                    x-model="dragon.marketMode">
+                                <option value="cn">A股</option>
+                                <option value="us">美股</option>
+                            </select>
+                        </label>
+                        <label class="text-xs text-gray-600 flex items-center gap-1" x-show="dragon.marketMode !== 'us'">
                             数据源
                             <select class="form-input" style="font-size:12px;padding:2px 6px;height:auto;"
                                     x-model="dragon.sourceMode">
@@ -1215,7 +1232,7 @@
                                     <th>代码</th><th>名称</th>
                                     <th class="text-right">涨幅</th>
                                     <th class="text-right">量比</th>
-                                    <th class="text-right">价</th>
+                                    <th class="text-right" x-text="dragon.marketMode === 'us' ? '价($)' : '价'"></th>
                                     <th>板块</th>
                                     <th class="text-right">板块涨</th>
                                     <th class="text-right">分</th>
@@ -1261,7 +1278,7 @@
                     <span class="badge badge-gray" x-text="(state.events || []).length + ' 条'"></span>
                 </div>
                 <div x-show="showEvents" x-cloak class="mt-3" x-transition>
-                    <div class="text-xs text-gray-500 mb-2">主循环每轮 + control/status 操作 + 推送告警 (CASE-B) 都会写入这里</div>
+                    <div class="text-xs text-gray-500 mb-2">主循环会标明本轮是 A 股、美股还是两边。熔断、清仓、信号和成交也写在这里。</div>
                     <template x-if="(state.events || []).length === 0">
                         <div class="text-gray-400 text-sm py-4 text-center">(暂无事件，启动模拟盘后会陆续写入)</div>
                     </template>
@@ -1292,7 +1309,7 @@
                 </div>
                 <div x-show="showEmergency" x-cloak class="mt-3" x-transition>
                     <div class="text-xs text-gray-500 mb-3">
-                        类似汽车手刹 -- 黑天鹅 / 策略失效 / 亏损过大时才用
+                        暂停买入、暂停交易、一键清仓、强制熔断都作用于 A 股和美股。清仓不等开盘，按最新价把股数大于 0 的持仓卖掉；美股用日 K 收盘。
                     </div>
 
                     <div class="grid grid-cols-2 gap-2">
@@ -1705,7 +1722,8 @@ function liveApp() {
         realHelpOpen: false,    // /live/real "为什么没连上" 折叠提示
         dragon: {               // 龙头战法面板 (CASE-C)
             show: false, loading: false, binding: false,
-            // sourceMode: 'mysql' / 'xtdata'；versionMode: 'v1' / 'v2'
+            // marketMode: 'cn' / 'us'；sourceMode: 'mysql' / 'xtdata'；versionMode: 'v1' / 'v2'
+            marketMode: 'cn',
             sourceMode: 'mysql',
             versionMode: 'v2',
             source: '', version: '', tradeDate: '', warning: '', items: [], loaded: false,
@@ -2980,6 +2998,7 @@ function liveApp() {
             this.dragon.loading = true;
             try {
                 const params = new URLSearchParams({
+                    market: this.dragon.marketMode || 'cn',
                     source: this.dragon.sourceMode || 'mysql',
                     version: this.dragon.versionMode || 'v2',
                 });
@@ -3034,7 +3053,7 @@ function liveApp() {
         // 危险操作二次确认: action ∈ {'force_clear_all', 'HALTED'}
         async confirmDanger(action) {
             const labels = {
-                force_clear_all: { tip: '一键清仓: 下一轮主循环会平掉全部持仓\n\n继续吗?',
+                force_clear_all: { tip: '一键清仓: 马上按最新价卖掉股数大于 0 的 A 股和美股\n\n继续吗?',
                                    call: () => this.ctrl('force_clear_all', true) },
                 HALTED:          { tip: '强制熔断: 立刻进入 HALTED 状态, 必须人工解除\n\n继续吗?',
                                    call: () => this.setStatus('HALTED') },

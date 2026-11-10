@@ -336,6 +336,83 @@ def share_lot(code: str) -> int:
     return 1 if str(code).upper().endswith(".US") else 100
 
 
+def is_us_code(code: str) -> bool:
+    return str(code).upper().endswith(".US")
+
+
+def session_market(codes: List[str]) -> str:
+    """本轮代码属于哪边市场: us / cn / both / 空。"""
+    us = any(is_us_code(c) for c in codes)
+    cn = any(c and not is_us_code(c) for c in codes)
+    if us and cn:
+        return "both"
+    if us:
+        return "us"
+    if cn:
+        return "cn"
+    return ""
+
+
+def unrealized_by_market(positions: List[dict]) -> tuple:
+    """持仓浮动盈亏拆成 A 股(人民币) 和美股(美元面额)。"""
+    cn = 0.0
+    us = 0.0
+    for pos in positions or []:
+        vol = int(pos.get("volume") or 0)
+        if vol <= 0:
+            continue
+        pnl = (float(pos.get("cur_price") or 0) - float(pos.get("cost") or 0)) * vol
+        if is_us_code(pos.get("code") or ""):
+            us += pnl
+        else:
+            cn += pnl
+    return cn, us
+
+
+def flatten_open_positions(positions: List[dict], price_of) -> tuple:
+    """把股数大于 0 的持仓全部卖掉，A 股和美股都平。
+
+    price_of(code) 返回最新价。没有价格的留下，并在 notes 里说明。
+    返回 (新持仓, 成交, 事件说明)。
+    """
+    positions = [dict(p) for p in (positions or [])]
+    orders = []
+    notes = []
+    for pos in list(positions):
+        code = str(pos.get("code") or "")
+        vol = int(pos.get("volume") or 0)
+        if not code or vol <= 0:
+            continue
+        price = float(price_of(code) or 0)
+        if price <= 0:
+            notes.append({
+                "level": "WARN",
+                "title": f"清仓跳过 {code}",
+                "message": "没有最新价",
+            })
+            continue
+        positions = apply_dry_run_fill(
+            positions, code, "sell", vol, price, name=str(pos.get("name") or ""),
+        )
+        orders.append({
+            "code": code,
+            "side": "sell",
+            "quantity": vol,
+            "price": round(price, 4),
+            "amount": round(vol * price, 2),
+            "status": "dry_run",
+            "reason": "一键清仓",
+            "strategy": "",
+        })
+        unit = "美元" if is_us_code(code) else "元"
+        notes.append({
+            "level": "CRITICAL",
+            "title": f"一键清仓 {code} {vol}股 @ {price:.2f}{unit}",
+            "message": str(pos.get("name") or ""),
+        })
+    return positions, orders, notes
+
+
 def size_buy_shares(price: float, budget: float, cash: float, lot: int = 100) -> int:
     """开仓股数: min(该档目标金额, 可用现金), 按手数取整; 额度不到 1 手则试探 1 手."""
     price = float(price)
@@ -475,10 +552,12 @@ class LiveTradingLoop:
 
         # 0) 检查 control.trading_status
         if s.get("trading_status") == "HALTED":
-            self.alert.alert("WARN", "交易已熔断, 跳过本轮", source="loop")
+            self._note(s, "WARN", "交易已熔断, 跳过本轮", source="loop")
+            self.state_store.save(s)
             return {"action": "halted_skip"}
         if s.get("trading_status") == "PAUSED":
-            self.alert.alert("INFO", "交易已暂停 (CEO 控制台暂停)", source="loop")
+            self._note(s, "INFO", "交易已暂停 (CEO 控制台暂停)", source="loop")
+            self.state_store.save(s)
             return {"action": "paused_skip"}
 
         # 1) health_check。这一轮只有美股时不连 QMT，行情在 trade_stock_us_daily。
@@ -491,8 +570,8 @@ class LiveTradingLoop:
             except Exception as e:
                 s["health"]["qmt_connected"] = False
                 s["health"]["errors_24h"] = s["health"].get("errors_24h", 0) + 1
-                self.alert.alert("CRITICAL", f"{tool_label()} 连接失败",
-                                 message=str(e), source="health")
+                self._note(s, "CRITICAL", f"{tool_label()} 连接失败",
+                           message=str(e), source="health")
                 self.state_store.save(s)
                 return {"action": "health_fail"}
         else:
@@ -519,17 +598,17 @@ class LiveTradingLoop:
 
         # 3) 熔断检查
         # 熔断看当前持仓浮动, 不含 4-1 以来已实现 (累计亏会一启动就熔断)
-        unreal = sum(
-            (float(p.get("cur_price") or 0) - float(p.get("cost") or 0)) * int(p.get("volume") or 0)
-            for p in (s.get("positions") or [])
-        )
+        # A 股按人民币、美股按美元面额，加进同一条线
+        cn_unreal, us_unreal = unrealized_by_market(s.get("positions") or [])
+        unreal = cn_unreal + us_unreal
         unreal_pct = unreal / self.capital if self.capital else 0
         if unreal_pct <= self.max_daily_loss_pct:
             s["trading_status"] = "HALTED"
-            self.alert.alert(
-                "CRITICAL", "触发当日亏损熔断",
-                message=f"浮动盈亏 {unreal_pct:.2%}, "
-                        f"已跌破熔断线 {self.max_daily_loss_pct:.2%}",
+            self._note(
+                s, "CRITICAL", "触发当日亏损熔断",
+                message=(f"浮动盈亏 {unreal_pct:.2%}, "
+                         f"已跌破熔断线 {self.max_daily_loss_pct:.2%}; "
+                         f"A股 {cn_unreal:,.0f} 元, 美股 {us_unreal:,.0f} 美元"),
                 source="circuit_breaker",
             )
             self.state_store.save(s)
@@ -543,8 +622,8 @@ class LiveTradingLoop:
                 try:
                     result = self.signal_evaluator(code, self.market, self.capital)
                 except Exception as e:
-                    self.alert.alert("WARN", f"signal_evaluator 异常 {code}",
-                                     message=str(e), source="zoe")
+                    self._note(s, "WARN", f"signal_evaluator 异常 {code}",
+                               message=str(e), source="zoe")
                     continue
                 if not result:
                     continue
@@ -575,8 +654,8 @@ class LiveTradingLoop:
                     **sig,
                     "ts": datetime.now().isoformat(timespec="seconds"),
                 })
-                self.alert.alert(
-                    "INFO", f"信号触发 -> {sig['side']} {sig['code']} [{sig.get('strategy','')}]",
+                self._note(
+                    s, "INFO", f"信号触发 -> {sig['side']} {sig['code']} [{sig.get('strategy','')}]",
                     source="zoe",
                 )
             s["signals"] = s["signals"][-100:]
@@ -604,14 +683,7 @@ class LiveTradingLoop:
         s["orders"] = s["orders"][-500:]
 
         # 6) 落盘 state (本轮所有改动: positions/today_pnl/pnl_history/health/signals/orders/events 一锅端)
-        s["events"] = s.get("events", [])
-        s["events"].append({
-            "ts": datetime.now().isoformat(timespec="seconds"),
-            "type": "loop_cycle",
-            "signal_count": len(new_signals),
-            "duration_ms": int((time.time() - cycle_start) * 1000),
-        })
-        s["events"] = s["events"][-200:]
+        self._note_cycle(s, codes, new_signals, int((time.time() - cycle_start) * 1000))
         self.state_store.save(s)
 
         return {
@@ -668,9 +740,9 @@ class LiveTradingLoop:
 
         # control.pause_buying 拦截
         if side == "buy" and state.get("control", {}).get("pause_buying"):
-            self.alert.alert("INFO", "买入被 CEO 控制台暂停",
-                             message=f"{code} {quantity}股 @ {price:.2f}",
-                             source="control")
+            self._note(state, "INFO", "买入被 CEO 控制台暂停",
+                       message=f"{code} {quantity}股 @ {price:.2f}",
+                       source="control")
             return {"code": code, "side": side, "quantity": quantity,
                     "price": price, "status": "paused_by_ceo"}
 
@@ -684,9 +756,10 @@ class LiveTradingLoop:
             state["positions"] = apply_dry_run_fill(
                 positions, code, side, quantity, price, name=name,
             )
-            self.alert.alert(
-                "INFO",
-                f"[DRY-RUN] 成交 {side} {code} {quantity}股 @ {price:.2f}",
+            unit = "美元" if is_us_code(code) else "元"
+            self._note(
+                state, "INFO",
+                f"[DRY-RUN] 成交 {side} {code} {quantity}股 @ {price:.2f}{unit}",
                 source="trader",
             )
             return {"code": code, "side": side, "quantity": quantity,
@@ -711,8 +784,8 @@ class LiveTradingLoop:
             trader.disconnect()
 
             if order_id:
-                self.alert.alert(
-                    "INFO", f"实盘下单成功 {side} {code}",
+                self._note(
+                    state, "INFO", f"实盘下单成功 {side} {code}",
                     message=f"委托编号 {order_id}, {quantity}股 @ {price:.2f}",
                     source="trader",
                 )
@@ -720,15 +793,78 @@ class LiveTradingLoop:
                         "price": price, "amount": amount, "status": "submitted",
                         "order_id": order_id, "ts": datetime.now().isoformat()}
             else:
-                self.alert.alert("WARN", f"实盘下单失败 {code}", source="trader")
+                self._note(state, "WARN", f"实盘下单失败 {code}", source="trader")
                 return {"code": code, "side": side, "quantity": quantity,
                         "price": price, "status": "failed",
                         "ts": datetime.now().isoformat()}
         except Exception as e:
-            self.alert.alert("CRITICAL", f"下单异常 {code}",
-                             message=str(e), source="trader")
+            self._note(state, "CRITICAL", f"下单异常 {code}",
+                       message=str(e), source="trader")
             return {"code": code, "side": side, "status": "exception",
                     "reason": str(e), "ts": datetime.now().isoformat()}
+
+    def _note(self, state: dict, level: str, title: str,
+              message: str = "", source: str = "") -> None:
+        """写进事件流，并走告警路由。连续相同标题不重复落盘。"""
+        events = state.setdefault("events", [])
+        last = events[-1] if events else {}
+        if last.get("title") != title or last.get("level") != level:
+            events.append({
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "level": level,
+                "title": title,
+                "message": message,
+                "source": source,
+            })
+            state["events"] = events[-200:]
+        self.alert.alert(level, title, message=message, source=source)
+
+    def _note_cycle(self, state: dict, codes: List[str], signals: List[dict],
+                    duration_ms: int) -> None:
+        state.setdefault("events", []).append({
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "type": "loop_cycle",
+            "market": session_market(codes),
+            "signal_count": len(signals),
+            "codes": [sig.get("code") for sig in signals if sig.get("code")],
+            "duration_ms": duration_ms,
+        })
+        state["events"] = state["events"][-200:]
+
+    def consume_force_clear(self) -> bool:
+        """一键清仓: 股数大于 0 的 A 股和美股都按最新价卖掉。收盘也能清。"""
+        state = self.state_store.load()
+        if not (state.get("control") or {}).get("force_clear_all"):
+            return False
+
+        def price_of(code: str) -> float:
+            tick = self.market.get_latest_tick(code)
+            last = tick_last_price(tick)
+            if last > 0:
+                return last
+            for pos in state.get("positions") or []:
+                if pos.get("code") == code:
+                    return float(pos.get("cur_price") or 0)
+            return 0.0
+
+        positions, orders, notes = flatten_open_positions(state.get("positions") or [], price_of)
+        state["positions"] = positions
+        state["orders"] = (state.get("orders") or []) + [
+            {**order, "ts": datetime.now().isoformat(timespec="seconds")}
+            for order in orders
+        ]
+        state["orders"] = state["orders"][-500:]
+        for note in notes:
+            self._note(state, note["level"], note["title"],
+                       message=note.get("message") or "", source="control")
+        if not notes:
+            self._note(state, "INFO", "一键清仓: 没有股数大于 0 的持仓", source="control")
+        state.setdefault("control", {})["force_clear_all"] = False
+        today_pnl, today_pct = calc_today_pnl(positions, self.capital)
+        state["today_pnl"] = today_pnl
+        state["today_pnl_pct"] = today_pct
+        self.state_store.save(state)
+        return True
 
     # ------------------------------------------------------------------
     # 长跑模式

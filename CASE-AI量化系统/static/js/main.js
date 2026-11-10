@@ -153,12 +153,18 @@ window.App = (function () {
     if (e.type === 'loop_cycle') {
       const sc = e.signal_count != null ? e.signal_count : 0;
       const ms = e.duration_ms != null ? e.duration_ms : 0;
-      const tail = sc === 0 ? '本轮无新信号' : `本轮触发 ${sc} 个信号`;
-      return `策略巡检 · ${tail} · 耗时 ${ms}ms`;
+      const market = e.market === 'us' ? '美股巡检'
+        : e.market === 'both' ? 'A股和美股巡检'
+        : e.market === 'cn' ? 'A股巡检'
+        : '策略巡检';
+      const names = Array.isArray(e.codes) && e.codes.length ? ' ' + e.codes.join('、') : '';
+      const tail = sc === 0 ? '本轮无新信号' : `本轮触发 ${sc} 个信号${names}`;
+      return `${market} · ${tail} · 耗时 ${ms}ms`;
     }
     const head = e.title || e.message || '';
+    const extra = e.message && e.title && e.message !== e.title ? ` ${e.message}` : '';
     const src  = e.source ? ` (来自 ${e.source})` : '';
-    return head + src;
+    return head + extra + src;
   }
 
   /** 简单移动平均 (前端画 MA 用) */

@@ -26,7 +26,7 @@
                 </ul>
                 <h4>数据 / 策略 / 撮合</h4>
                 <ul>
-                    <li><b>行情</b>: 日 K 前复权。A 股在 <code>WUCAI_QMT=qmt/miniqmt</code> 时直拉券商，<code>tdx</code> 时读 MySQL。美股代码写 <code>COHR</code> 或 <code>COHR.US</code>，只读 <code>trade_stock_us_daily</code>。</li>
+                    <li><b>行情</b>: 日 K 前复权。A 股在 <code>WUCAI_QMT=qmt/miniqmt</code> 时直拉券商，<code>tdx</code> 时读 MySQL。美股代码写 <code>COHR</code> 或 <code>COHR.US</code>。运行回测和策略对比都会先把这一只的最新日 K 写入 <code>trade_stock_us_daily</code>，采集失败则不回测。</li>
                     <li><b>策略</b>: 与 <code>/live</code> 共用 <code>strategy_registry</code> 日 K evaluator, 不写成 Backtrader 策略类。</li>
                     <li><b>撮合</b>: 收盘出信号、次日开盘成交，滑点 0.1%，单只最多用 95% 资金。A 股还有 T+1、涨跌停拒单、印花税和 100 股整手。美股按 1 股成交，不计涨跌停、T+1 和印花税。</li>
                 </ul>
@@ -113,7 +113,7 @@
                         </div>
                         <div class="text-xs text-gray-500 font-normal mt-0.5"
                              x-show="result"
-                             x-text="(result && result.params && result.metrics) ? (result.params.start_date + ' ~ ' + result.params.end_date + ' · ' + result.metrics.trading_days + ' 个交易日' + (String(result.stock_code || '').endsWith('.US') ? ' · 美股 1 股成交，无涨跌停 / T+1 / 印花税' : '')) : ''"></div>
+                             x-text="(result && result.params && result.metrics) ? (result.params.start_date + ' ~ ' + result.params.end_date + ' · ' + result.metrics.trading_days + ' 个交易日' + (result.data_note ? ' · ' + result.data_note : '') + (String(result.stock_code || '').endsWith('.US') ? ' · 美股 1 股成交，无涨跌停 / T+1 / 印花税' : '')) : ''"></div>
                     </div>
                 </div>
                 <div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm" x-show="result">

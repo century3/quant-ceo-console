@@ -1,0 +1,1364 @@
+{% extends "base.html" %}
+{% block title %}复盘 & 策略管理 -- AI 量化系统{% endblock %}
+
+{% block content %}
+<div x-data="reviewApp()">
+
+    <!-- 使用说明 modal -->
+    <div class="modal-overlay" x-show="showHelp" x-cloak @click.self="showHelp = false">
+        <div class="modal-card">
+            <div class="modal-header">
+                <div class="modal-title">复盘 & 策略管理 -- 使用说明</div>
+                <button class="modal-close" @click="showHelp = false">×</button>
+            </div>
+            <div class="modal-body">
+                <h4>这个 Tab 是干嘛的</h4>
+                <p>赚了是<b>运气还是实力</b>? 这个 Tab 用统计方法回答这个问题; 上线体检回答<b>这套策略+这只股票该观察、加仓还是停</b>。</p>
+
+                <h4>三个子功能</h4>
+                <ul>
+                    <li><b>Brinson 归因</b> -- 把超额收益拆成"配置效应 (赌赛道)" + "选股效应 (Alpha)" + "交互". 3 个数据源任选: <b>模拟盘成交</b> / <b>实盘交割单</b> / 演示数据. 顶部流水面板可以单独看订单 + 成本水位 (bps).</li>
+                    <li><b>Walk-Forward 过拟合检测</b> -- 滚动训练/评估窗口, 暴露策略真实 OOS 表现, 上实盘前的核心检测</li>
+                    <li><b>策略生命周期</b> -- 按「策略 + 股票」体检: 继续观察 / 可以上实盘 / 建议停用. 只给建议, 不改仓位</li>
+                </ul>
+
+                <h4>典型场景</h4>
+                <div class="example-block">
+                    <b>场景 1 (周末复盘)</b>: 跑 Brinson, 看本周赚的钱主要来自<b>赌赛道</b>还是<b>选对股</b>;
+                    选股效应弱 → 多因子模型要调整<br/><br/>
+                    <b>场景 2 (上线前过拟合体检)</b>: 新策略先在 Walk-Forward 里跑;
+                    OOS/IS &ge; 0.7 才放行, 否则压缩参数空间 / 换样本继续调<br/><br/>
+                    <b>场景 3 (加仓还是停)</b>: 某一票的某一套策略, 模拟盘满 20 天、收益为正、回撤 &lt; 5% → 可以上实盘, 先给约 5%;
+                    回撤 &gt; 20% → 这对本停
+                </div>
+
+                <h4>数据来源</h4>
+                <ul>
+                    <li><b>Brinson 归因</b>: 顶部"数据源"下拉支持三个选择
+                        <ul>
+                            <li><b>模拟盘 (默认)</b>: 用 <code>live_state.json</code> 订单流水 (已平仓 + 期末未平仓盯市). A 股对照沪深300 + 申万一级; 美股只取 <code>.US</code> 成交, 行业用 <code>trade_stock_us_status</code>, 基准是除指数外的美股行业等权. 区间默认 2026-04-01 至今</li>
+                            <li><b>实盘交割单</b>: 同一套成交口径, 数据来自券商「历史成交」CSV. 区间取文件名导出起止日 (如 260101-260325 → 2026-01-01 ~ 2026-03-25), 未平仓按截止日收盘盯市, 截止日之后的买卖不进这张单. QMT 只有现仓和当日成交, 不能当区间复盘</li>
+                            <li><b>演示数据</b>: 教学构造的「AI 主线月」行业权重/收益, 不是真实持仓, 用来手算对照 BHB 公式</li>
+                        </ul>
+                    </li>
+                    <li><b>申万一级字典</b>: xtdata 拉取后缓存到 <code>outputs/sw1_industry_map.json</code>, TTL 7 天; 可点"刷新行业字典"立即更新</li>
+                    <li><b>上线体检</b>: 模拟盘按当前路由回放 4 月 1 日以来的成交, 一票一套策略各算各的. 不评整户净值</li>
+                </ul>
+
+                <h4>Brinson 实现说明</h4>
+                <ul class="text-xs">
+                    <li>A 股基准: 沪深300 行业内<b>等权</b> (该行业有几只成分股 / 有效成分数, 不按市值加权)</li>
+                    <li>美股基准: <code>trade_stock_us_status</code> 里除「指数」外的股票, 按行业家数等权; 行情读 <code>trade_stock_us_daily</code></li>
+                    <li>模拟盘 / 实盘都按区间内全部买卖进账 (已卖掉的票也复盘); 权重按累计买入金额; 未平仓按截止日期收盘盯市. CSV 默认区间是文件名导出起止日, 不是最后一笔成交日</li>
+                    <li>境外标的 (e.g. 513100.SH 纳指 ETF): 归到 "境外/其他" bucket, 进入"配置效应" (基准无此行业)</li>
+                    <li>基准区间收益: <code>end 收盘 / start 开盘 - 1</code>, 来自 MySQL <code>trade_stock_daily</code></li>
+                </ul>
+
+                <h4>Walk-Forward 实现说明</h4>
+                <ul class="text-xs">
+                    <li><b>流程</b>: 在每个时间窗口的训练期 (默认 120 天) 从候选参数里挑 Sharpe 最高的, 然后用这组参数在紧接的评估期 (默认 60 天) 跑 OOS, 滚动到下一段重复</li>
+                    <li><b>行情</b>: A 股走原来的日 K。美股写 <code>RKLB</code> 或 <code>RKLB.US</code>，读 <code>trade_stock_us_daily</code></li>
+                    <li><b>4 个内置策略</b>: 双均线 (趋势) / 布林带反转 / RSI 反转 / 唐奇安通道突破 -- 覆盖经典三大风格</li>
+                    <li><b>OOS/IS 比例</b>: &ge; 0.7 相对鲁棒, 0.5~0.7 中度衰减, &lt; 0.5 严重过拟合</li>
+                    <li><b>过拟合分数</b>: <code>(IS_Sharpe - OOS_Sharpe) / IS_Sharpe</code>, &lt; 30% 鲁棒 / 30~70% 中度 / &gt; 70% 严重</li>
+                    <li><b>注意</b>: 当 IS Sharpe &le; 0 (策略训练期都不赚钱) 时 OOS/IS 与过拟合分数会被强制设为 0, 此时 verdict OK 是<b>假阳性</b>, 必须 IS &gt; 0 + OOS/IS &ge; 0.7 才算真鲁棒</li>
+                    <li><b>典型经验</b>: A 股个股 + 简单技术指标策略 (双参数级别) 几乎都会显示严重过拟合, 这是策略本身的局限. 真要找鲁棒策略需要换更复杂的模型 (多因子选股 / 风险平价 / 配对交易等)</li>
+                </ul>
+
+                <h4>上线体检实现说明</h4>
+                <ul class="text-xs">
+                    <li>一票一策略. 茅台上的 MACD 和纳指上的 MACD 分开算, 分母是这对本金 (峰值占用)</li>
+                    <li>模拟盘升小仓: 20 天 + 收益 &gt; 0 + 回撤 &lt; 5%; 回撤 &gt; 20% 建议停这对本</li>
+                    <li>工具只给建议仓位 (0 / 5% / 30%), 不会改 /live 的真实仓位</li>
+                    <li>实盘成交没有我们的策略名, 所以这页只评模拟盘</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+
+    <!-- 子 Tab nav -->
+    <div class="flex items-center gap-2 mb-4">
+        <button class="btn" :class="subTab === 'brinson' ? 'btn-primary' : 'btn-secondary'"
+                @click="subTab = 'brinson'">Brinson 归因</button>
+        <button class="btn" :class="subTab === 'walkforward' ? 'btn-primary' : 'btn-secondary'"
+                @click="subTab = 'walkforward'; ensureWfStrategiesLoaded(); loadWfHoldings()">Walk-Forward 过拟合检测</button>
+        <button class="btn" :class="subTab === 'lifecycle' ? 'btn-primary' : 'btn-secondary'"
+                @click="subTab = 'lifecycle'; evalLifecycleSim(true)">策略生命周期</button>
+        <div class="flex-1"></div>
+        <button class="help-btn" @click="showHelp = true" title="使用说明">?</button>
+    </div>
+
+    <!-- Brinson -->
+    <div x-show="subTab === 'brinson'">
+
+        <!-- 交割单 / 历史成交 (跟随主"数据源"自动加载, real / demo 模式隐藏) -->
+        <details class="card mb-3"
+                 x-show="brSource === 'csv' || brSource === 'sim'"
+                 @toggle="onTradeRecordToggle($event)">
+            <summary class="card-header cursor-pointer select-none">
+                <div>
+                    <div class="card-title">
+                        <span x-text="brSource === 'csv' ? '交割单流水' : '模拟盘订单流水'"></span>
+                        <span class="text-xs text-gray-400 font-normal">+ 成本核算, 点开展开</span>
+                    </div>
+                    <div class="text-xs text-gray-500 font-normal mt-0.5"
+                         x-text="brSource === 'csv'
+                                 ? '区间内每一笔买卖 + 真实手续费 (券商 CSV 自带), 自动汇总成 bps 成本 -- 看你赚的 Alpha 是不是被摩擦吃掉了'
+                                 : '模拟盘的每一笔订单 + 估算手续费, 给下方 Brinson 看流水水位'"></div>
+                </div>
+                <span class="text-xs text-gray-500" x-show="trReport && trReport.source_label"
+                      x-text="trReport ? ('已加载: ' + trReport.source_label + ' · ' + (trReport.summary?.n || 0) + ' 笔') : ''"></span>
+            </summary>
+            <div class="p-3 border-t" style="border-color: #e5e7eb;">
+                <div x-show="trRunning" class="text-xs text-gray-500 mb-2">加载中...</div>
+                <div x-show="trError"
+                     class="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded px-2 py-1 mb-2"
+                     x-text="trError"></div>
+                <!-- 友好的"暂无流水"提示 (sim 模式 orders 空, 不是错误) -->
+                <div x-show="trReport && trReport.empty_reason"
+                     class="text-xs text-sky-800 bg-sky-50 border border-sky-200 rounded px-2 py-2 mb-2 leading-relaxed"
+                     x-text="trReport?.empty_reason"></div>
+
+                <!-- 成本汇总 4 卡 (n > 0 才显示) -->
+                <div x-show="trReport && trReport.summary && trReport.summary.n > 0" class="grid grid-cols-4 gap-2 mb-3">
+                    <div class="bg-gray-50 border border-gray-200 rounded p-2">
+                        <div class="text-xs text-gray-500">订单数</div>
+                        <div class="text-lg font-bold" x-text="(trReport?.summary?.n || 0) + ' 笔'"></div>
+                    </div>
+                    <div class="bg-gray-50 border border-gray-200 rounded p-2">
+                        <div class="text-xs text-gray-500">总成本
+                            <span class="text-gray-400" x-text="trReport?.real_cost ? '(真实)' : '(估算)'"></span>
+                        </div>
+                        <div class="text-lg font-bold" x-text="(trReport?.summary?.total_cost || 0).toFixed(2) + ' 元'"></div>
+                    </div>
+                    <div class="bg-gray-50 border border-gray-200 rounded p-2">
+                        <div class="text-xs text-gray-500">成交金额</div>
+                        <div class="text-lg font-bold" x-text="((trReport?.summary?.amount || 0) / 10000).toFixed(2) + ' 万'"></div>
+                    </div>
+                    <div class="bg-gray-50 border border-gray-200 rounded p-2">
+                        <div class="text-xs text-gray-500">成本/成交</div>
+                        <div class="text-lg font-bold" x-text="(trReport?.summary?.bps || 0).toFixed(1) + ' bps'"></div>
+                    </div>
+                </div>
+
+                <!-- 明细表 -->
+                <div x-show="trReport && trReport.rows && trReport.rows.length > 0" class="overflow-x-auto">
+                    <table class="app-table text-xs">
+                        <thead>
+                            <tr>
+                                <th>日期</th><th>代码</th><th>名称</th>
+                                <th class="text-center">方向</th>
+                                <th class="text-right">数量</th>
+                                <th class="text-right">价格</th>
+                                <th class="text-right">金额</th>
+                                <th class="text-right">佣金</th>
+                                <th class="text-right">印花税</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <template x-for="(r, i) in (trReport?.rows || [])" :key="i">
+                                <tr>
+                                    <td x-text="r.trade_date"></td>
+                                    <td><code x-text="r.code"></code></td>
+                                    <td x-text="r.name"></td>
+                                    <td class="text-center">
+                                        <span :class="r.side === 'buy' ? 'text-rose-600' : 'text-emerald-600'"
+                                              x-text="r.side === 'buy' ? '买' : '卖'"></span>
+                                    </td>
+                                    <td class="text-right num" x-text="(r.quantity || 0).toLocaleString()"></td>
+                                    <td class="text-right num" x-text="(r.price || 0).toFixed(3)"></td>
+                                    <td class="text-right num" x-text="(r.amount || 0).toFixed(2)"></td>
+                                    <td class="text-right num" x-text="(r.commission || 0).toFixed(2)"></td>
+                                    <td class="text-right num" x-text="(r.stamp_duty || 0).toFixed(2)"></td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </details>
+
+        <!-- 数据源 + 区间控件 -->
+        <div class="card mb-3">
+            <div class="card-header">
+                <div>
+                    <div class="card-title">数据源</div>
+                    <div class="text-xs text-gray-500 font-normal mt-0.5"
+                         x-text="brSourceHint()"></div>
+                </div>
+                <div class="flex items-end gap-2 flex-wrap">
+                    <div>
+                        <label class="block text-xs text-gray-600 mb-1">数据源</label>
+                        <select class="form-control" x-model="brSource"
+                                @change="onBrSourceChange()" style="width: 200px;">
+                            <option value="sim">模拟盘 (默认)</option>
+                            <option value="csv">实盘交割单</option>
+                            <option value="demo">演示数据 (公式对照)</option>
+                        </select>
+                    </div>
+                    <div x-show="brSource !== 'demo'">
+                        <label class="block text-xs text-gray-600 mb-1">市场</label>
+                        <select class="form-control" x-model="brMarket" style="width: 120px;">
+                            <option value="cn">A股</option>
+                            <option value="us">美股</option>
+                        </select>
+                    </div>
+                    <div x-show="brSource === 'csv'">
+                        <label class="block text-xs text-gray-600 mb-1">CSV 文件
+                            <span class="text-xs text-gray-400 font-normal"
+                                  x-text="'(共 ' + (csvFiles?.length || 0) + ' 份)'"></span>
+                        </label>
+                        <select class="form-control" x-model="csvPath"
+                                @change="onCsvPathChange()" style="width: 280px;">
+                            <template x-for="f in (csvFiles || [])" :key="f.path">
+                                <option :value="f.path" x-text="f.name + '  (' + f.label + ')'"></option>
+                            </template>
+                        </select>
+                    </div>
+                    <div x-show="brSource !== 'demo'">
+                        <label class="block text-xs text-gray-600 mb-1">起始日期</label>
+                        <input type="date" class="form-control" x-model="brStart" style="width: 140px;">
+                    </div>
+                    <div x-show="brSource !== 'demo'">
+                        <label class="block text-xs text-gray-600 mb-1">截止日期</label>
+                        <input type="date" class="form-control" x-model="brEnd" style="width: 140px;">
+                    </div>
+                    <button class="btn btn-primary btn-sm" @click="runBrinsonSwitch()" :disabled="brinsonRunning">
+                        <span x-show="!brinsonRunning">运行</span>
+                        <span x-show="brinsonRunning">运行中...</span>
+                    </button>
+                </div>
+                <p x-show="brSource === 'csv'" class="text-xs text-gray-500 mt-2">
+                    区间按交割单文件名的导出起止日自动填, 未平仓按截止日期收盘盯市; 截止日之后的买卖不进这张单. 可手改日期再跑.
+                </p>
+            </div>
+            <!-- 真实数据元信息: cache 时间 / 沪深300 成员数 + 高级动作 -->
+            <div x-show="brSource !== 'demo' && brinsonReal && brinsonReal.industry_map"
+                 class="text-xs text-gray-500 mt-2 leading-relaxed flex items-center justify-between flex-wrap gap-2">
+                <div x-show="brMarket !== 'us'">
+                    行业字典 cache: <code x-text="brinsonReal?.industry_map?.built_at || '-'"></code>
+                    · 申万一级 <span x-text="brinsonReal?.industry_map?.sw1_count || 0"></span> 个
+                    · 沪深300 当期 <span x-text="brinsonReal?.industry_map?.hs300_count || 0"></span> 只
+                    · 基准实际算入 <span x-text="brinsonReal?.benchmark?.valid_count || 0"></span> 只
+                    <span class="text-gray-400">(部分剔除是因为停牌/退市/数据缺失)</span>
+                </div>
+                <div x-show="brMarket === 'us'">
+                    美股行业 <span x-text="brinsonReal?.industry_map?.sector_count || 0"></span> 个
+                    · 基准股票 <span x-text="brinsonReal?.industry_map?.universe_count || 0"></span> 只
+                    · 实际算入 <span x-text="brinsonReal?.benchmark?.valid_count || 0"></span> 只
+                    <span class="text-gray-400">(指数不进基准; 区间行情不足的不计入)</span>
+                </div>
+                <a href="#"
+                   class="text-gray-500 hover:text-gray-800 underline decoration-dotted"
+                   @click.prevent="refreshIndustryMap()"
+                   x-show="brMarket !== 'us' && !indMapBusy"
+                   title="重建申万一级行业字典 cache (默认 7 天 TTL, 一年点不了几次)">
+                    高级 ▸ 刷新行业字典
+                </a>
+                <span x-show="indMapBusy" class="text-gray-500">刷新中...</span>
+            </div>
+            <div x-show="brSource !== 'demo' && brinsonError"
+                 class="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded px-2 py-1 mt-2"
+                 x-text="brinsonError"></div>
+        </div>
+
+        <!-- 演示数据: 先讲清楚这是什么, 再给结果 -->
+        <div x-show="brSource === 'demo'" class="card mb-3" style="border-color:#f59e0b;">
+            <div class="card-header">
+                <div>
+                    <div class="card-title">演示数据不是真实持仓</div>
+                    <div class="text-xs text-gray-500 font-normal mt-0.5"
+                         x-text="(brinson && brinson.scenario && brinson.scenario.title)
+                                 || 'AI 主线月 (教学构造)'"></div>
+                </div>
+            </div>
+            <div class="text-sm leading-relaxed text-gray-700 space-y-2">
+                <p x-text="(brinson && brinson.scenario && brinson.scenario.story)
+                           || '重仓通信 30% / 电子 25% / 电力设备 20%, 低配银行 5%; 食品饮料、医药生物组合没配.'"></p>
+                <p class="text-xs text-gray-500"
+                   x-text="(brinson && brinson.scenario && brinson.scenario.return_note)
+                           || '行业基准收益是示意数字 (通信当月 +9.7%); 组合内假设选了龙头, 所以通信 +11.5%、电子 +7.2%, 都比基准略高.'"></p>
+                <p class="text-xs text-gray-600"
+                   x-text="(brinson && brinson.scenario && brinson.scenario.purpose)
+                           || '数字事先给定, 用来手算对照 BHB: 配置=(Wp-Wb)×Rb, 选股=Wb×(Rp-Rb), 交互=(Wp-Wb)×(Rp-Rb). 三因子加总应对上超额 +5.70%.'"></p>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-header">
+                <div class="card-title">归因结果
+                    <span class="text-xs text-gray-400 font-normal"
+                          x-text="brSource === 'sim' ? '(模拟盘成交)'
+                                  : brSource === 'csv'  ? '(实盘交割单)'
+                                  : '(演示: 对照公式)'"></span>
+                </div>
+                <span class="text-xs text-gray-500"
+                      x-show="brSource !== 'demo' && brinsonReal?.params"
+                      x-text="brinsonReal?.params?.start + ' ~ ' + brinsonReal?.params?.end
+                              + ' · ' + (brinsonReal?.params?.elapsed_sec || 0) + 's'"></span>
+            </div>
+            <template x-if="!brinson">
+                <div class="text-gray-400 text-sm py-6 text-center">点右上按钮跑一次</div>
+            </template>
+            <!-- 一眼读懂: 跑完后给个定性结论 -->
+            <template x-if="brinson">
+                <div class="px-3 py-2 mb-2 rounded text-sm leading-relaxed"
+                     :class="brinsonHeadlineClass()"
+                     x-text="brinsonHeadline()"></div>
+            </template>
+            <template x-if="brinson">
+                <table class="app-table">
+                    <tbody>
+                        <tr><td>组合收益</td>
+                            <td class="text-right num"
+                                :class="App.pnlClass(brinson.portfolio_return)"
+                                x-text="App.fmtPct(brinson.portfolio_return, 2)"></td></tr>
+                        <tr><td>基准收益</td>
+                            <td class="text-right num" x-text="App.fmtPct(brinson.benchmark_return, 2)"></td></tr>
+                        <tr><td><b>超额收益</b></td>
+                            <td class="text-right num font-bold"
+                                :class="App.pnlClass(brinson.excess_return)"
+                                x-text="App.fmtPct(brinson.excess_return, 2)"></td></tr>
+                        <tr><td>配置效应 (赌赛道)</td>
+                            <td class="text-right num"
+                                :class="App.pnlClass(brinson.allocation_effect)"
+                                x-text="App.fmtPct(brinson.allocation_effect, 2)"></td></tr>
+                        <tr><td>选股效应 (Alpha)</td>
+                            <td class="text-right num"
+                                :class="App.pnlClass(brinson.selection_effect)"
+                                x-text="App.fmtPct(brinson.selection_effect, 2)"></td></tr>
+                        <tr><td>交互效应</td>
+                            <td class="text-right num"
+                                :class="App.pnlClass(brinson.interaction_effect)"
+                                x-text="App.fmtPct(brinson.interaction_effect, 2)"></td></tr>
+                    </tbody>
+                </table>
+            </template>
+            <div class="text-xs text-gray-500 mt-3 pt-2 border-t border-gray-100">
+                <b>超额收益 = 配置效应 + 选股效应 + 交互效应</b>.
+                配置 = 调高/调低某行业的权重赚到的钱; 选股 = 在某行业里挑出比基准更牛的股票赚到的钱; 交互 = 二者耦合.
+            </div>
+        </div>
+
+    <!-- 详细分行业明细 (Brinson) -->
+    <div x-show="brinson && brinson.by_industry"
+         class="card mt-4">
+        <div class="card-title mb-3"
+             x-text="brSource === 'demo' ? '各行业贡献明细 (代入公式的 Wp / Wb / Rp / Rb)' : '各行业贡献明细'"></div>
+        <div x-show="brSource === 'demo'" class="text-xs text-gray-500 mb-2">
+            这一张表就是演示的输入. 通信超配 30% vs 基准 5%, 基准涨 9.7%, 配置项会很大 -- 用来对照公式, 不是某个月的真实持仓.
+        </div>
+        <table class="app-table">
+            <thead><tr>
+                <th>行业</th>
+                <th class="text-right">组合权重</th>
+                <th class="text-right">基准权重</th>
+                <th class="text-right">组合收益</th>
+                <th class="text-right">基准收益</th>
+                <th class="text-right">配置</th>
+                <th class="text-right">选股</th>
+                <th class="text-right">合计</th>
+            </tr></thead>
+            <tbody>
+                <template x-for="r in brinsonByIndustrySorted()" :key="r.industry">
+                    <tr>
+                        <td x-text="r.industry"></td>
+                        <td class="text-right num" x-text="App.fmtPct(r.Wp, 1)"></td>
+                        <td class="text-right num" x-text="App.fmtPct(r.Wb, 1)"></td>
+                        <td class="text-right num" :class="App.pnlClass(r.Rp)" x-text="App.fmtPct(r.Rp, 2)"></td>
+                        <td class="text-right num" :class="App.pnlClass(r.Rb)" x-text="App.fmtPct(r.Rb, 2)"></td>
+                        <td class="text-right num" :class="App.pnlClass(r.allocation)" x-text="App.fmtPct(r.allocation, 2)"></td>
+                        <td class="text-right num" :class="App.pnlClass(r.selection)" x-text="App.fmtPct(r.selection, 2)"></td>
+                        <td class="text-right num font-bold" :class="App.pnlClass(r.total)" x-text="App.fmtPct(r.total, 2)"></td>
+                    </tr>
+                </template>
+            </tbody>
+        </table>
+    </div>
+
+    <!-- 成交流水明细 (csv / sim) -->
+    <div x-show="(brSource === 'csv' || brSource === 'sim')
+                 && brinsonReal && (brinsonReal?.trades_detail || []).length > 0"
+         class="card mt-4">
+        <div class="card-header">
+            <div>
+                <div class="card-title"
+                     x-text="brSource === 'csv' ? '实盘成交明细 (单股 PnL 拆解)' : '模拟盘成交明细 (单股 PnL 拆解)'"></div>
+                <div class="text-xs text-gray-500 font-normal mt-0.5">
+                    区间内
+                    <span x-text="(brinsonReal?.trades_detail || []).length"></span>
+                    只标的有成交.
+                    <strong>已实现 PnL</strong> = 卖出金额 - 买入金额 (期末已平仓);
+                    <strong>未实现 PnL</strong> = 净仓 × 期末收盘价 - 净仓对应买入金额 (期末仍持仓, mark-to-market).
+                </div>
+            </div>
+        </div>
+
+        <!-- 概要 KPI -->
+        <div class="kpi-grid mb-3" x-show="brinsonReal?.trades_summary">
+            <div class="kpi"><div class="kpi-label">标的数</div>
+                <div class="kpi-value" x-text="brinsonReal?.trades_summary?.n_codes || 0"></div>
+            </div>
+            <div class="kpi"><div class="kpi-label">总买入投入</div>
+                <div class="kpi-value num" x-text="App.fmtNum(brinsonReal?.trades_summary?.total_buy, 0)"></div>
+            </div>
+            <div class="kpi"><div class="kpi-label">总损益 (已实现+未实现)</div>
+                <div class="kpi-value num"
+                     :class="App.pnlClass(brinsonReal?.trades_summary?.total_pnl)"
+                     x-text="(brinsonReal?.trades_summary?.total_pnl >= 0 ? '+' : '') + App.fmtNum(brinsonReal?.trades_summary?.total_pnl, 0)"></div>
+            </div>
+            <div class="kpi"><div class="kpi-label">组合区间收益率</div>
+                <div class="kpi-value num"
+                     :class="App.pnlClass(brinsonReal?.trades_summary?.portfolio_ret)"
+                     x-text="App.fmtPct(brinsonReal?.trades_summary?.portfolio_ret, 2)"></div>
+            </div>
+        </div>
+
+        <table class="app-table">
+            <thead><tr>
+                <th>代码</th>
+                <th>名称</th>
+                <th x-text="brMarket === 'us' ? '美股行业' : '申万一级'"></th>
+                <th class="text-right">买入</th>
+                <th class="text-right">卖出</th>
+                <th class="text-right">净仓</th>
+                <th class="text-right">期末收盘</th>
+                <th class="text-right">期末市值</th>
+                <th class="text-right">总损益</th>
+                <th class="text-right">收益率</th>
+                <th>状态</th>
+            </tr></thead>
+            <tbody>
+                <template x-for="r in (brinsonReal?.trades_detail || [])" :key="r.code">
+                    <tr>
+                        <td class="num text-xs" x-text="r.code"></td>
+                        <td x-text="r.name || '-'"></td>
+                        <td>
+                            <span :class="r.industry === '境外/其他' ? 'badge badge-warning' : 'badge badge-info'"
+                                  x-text="r.industry"></span>
+                        </td>
+                        <td class="text-right num" x-text="App.fmtNum(r.buy_amt, 0)"></td>
+                        <td class="text-right num" x-text="App.fmtNum(r.sell_amt, 0)"></td>
+                        <td class="text-right num" x-text="App.fmtNum(r.net_qty, 0)"></td>
+                        <td class="text-right num"
+                            x-text="r.end_close ? App.fmtNum(r.end_close, 2) : '-'"></td>
+                        <td class="text-right num" x-text="App.fmtNum(r.end_value, 0)"></td>
+                        <td class="text-right num"
+                            :class="App.pnlClass(r.total_pnl)"
+                            x-text="(r.total_pnl >= 0 ? '+' : '') + App.fmtNum(r.total_pnl, 0)"></td>
+                        <td class="text-right num"
+                            :class="App.pnlClass(r.ret)"
+                            x-text="App.fmtPct(r.ret, 2)"></td>
+                        <td class="text-xs">
+                            <span :class="r.closed ? 'badge badge-success' : 'badge badge-warning'"
+                                  x-text="r.closed ? '已平仓' : '持仓中'"></span>
+                        </td>
+                    </tr>
+                </template>
+            </tbody>
+        </table>
+    </div>
+
+    </div>
+    <!-- /Brinson 外层 wrapper 关 -->
+
+    <!-- Walk-Forward 过拟合检测 -->
+    <div x-show="subTab === 'walkforward'" x-init="ensureWfStrategiesLoaded()">
+
+        <!-- 配置卡 -->
+        <div class="card mb-3">
+            <div class="card-header">
+                <div>
+                    <div class="card-title">Walk-Forward 配置</div>
+                    <div class="text-xs text-gray-500 font-normal mt-0.5"
+                         x-text="wfStrategyMeta()?.description || '请选择策略'"></div>
+                </div>
+                <div class="flex items-center gap-2">
+                    <button type="button" class="btn btn-secondary btn-sm"
+                            @click="wfShowAdvanced = !wfShowAdvanced"
+                            :title="wfShowAdvanced ? '收起参数候选编辑' : '展开参数候选编辑 (默认 6 组, 可自定义)'">
+                        <span x-text="wfShowAdvanced ? '高级 ▴' : '高级 ▾'"></span>
+                    </button>
+                    <button class="btn btn-primary btn-sm" @click="runWalkForward()" :disabled="wfRunning">
+                        <span x-show="!wfRunning">运行</span>
+                        <span x-show="wfRunning">运行中...</span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- 第一行: 策略 + 标的 + 快捷预设 -->
+            <div class="flex items-end gap-3 flex-wrap mt-3">
+                <div>
+                    <label class="block text-xs text-gray-600 mb-1">策略</label>
+                    <select class="form-control" x-model="wfStrategy"
+                            @change="onWfStrategyChange()" style="width: 220px;">
+                        <template x-for="s in wfStrategies" :key="s.key">
+                            <option :value="s.key" x-text="s.label"></option>
+                        </template>
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-xs text-gray-600 mb-1">标的代码</label>
+                    <input type="text" class="form-control" x-model="wfCode"
+                           placeholder="600519.SH / RKLB" style="width: 160px;">
+                </div>
+                <div class="flex-1 min-w-0">
+                    <label class="block text-xs text-gray-600 mb-1">持仓标的</label>
+                    <div class="flex gap-1 flex-wrap">
+                        <template x-for="p in wfPresets" :key="p.code">
+                            <button type="button"
+                                    class="px-2 py-1 text-xs rounded border"
+                                    :class="wfCode === p.code
+                                            ? 'bg-blue-50 border-blue-400 text-blue-700'
+                                            : 'border-gray-300 text-gray-700 hover:bg-gray-50'"
+                                    @click="wfCode = p.code"
+                                    x-text="p.label"></button>
+                        </template>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 教学对照: 有过关的, 也有失败的, 避免学员以为 Walk-Forward 只会报过拟合 -->
+            <div class="mt-3 pt-3 border-t border-gray-100">
+                <div class="text-xs text-gray-600 mb-1">教学对照 (点一下填好策略+标的+窗口, 再点运行)</div>
+                <div class="flex gap-1 flex-wrap">
+                    <template x-for="ex in wfExamples" :key="ex.key">
+                        <button type="button"
+                                class="px-2 py-1 text-xs rounded border"
+                                :class="wfExampleActive(ex)
+                                        ? (ex.tone === 'ok'
+                                            ? 'bg-emerald-50 border-emerald-400 text-emerald-700'
+                                            : (ex.tone === 'none'
+                                                ? 'bg-slate-50 border-slate-400 text-slate-700'
+                                                : 'bg-rose-50 border-rose-400 text-rose-700'))
+                                        : 'border-gray-300 text-gray-700 hover:bg-gray-50'"
+                                @click="applyWfExample(ex)"
+                                x-text="ex.label"></button>
+                    </template>
+                </div>
+                <div class="text-xs text-gray-400 mt-1.5 leading-relaxed">
+                    Walk-Forward 不是专门报过拟合的. 趋势策略配成长股、均值回归配震荡标的可以过关;
+                    同一套双均线换到茅台会显示「无正向信号」. 先把过关和失败都跑一遍再下结论.
+                </div>
+            </div>
+
+            <!-- 第二行: 窗口参数 -->
+            <div class="flex items-end gap-3 flex-wrap mt-3">
+                <div>
+                    <label class="block text-xs text-gray-600 mb-1">回望日数</label>
+                    <input type="number" class="form-control" x-model.number="wfCount"
+                           min="200" max="2000" step="100" style="width: 110px;">
+                </div>
+                <div>
+                    <label class="block text-xs text-gray-600 mb-1">训练窗口 (天)</label>
+                    <input type="number" class="form-control" x-model.number="wfTrain"
+                           min="20" max="500" step="10" style="width: 110px;">
+                </div>
+                <div>
+                    <label class="block text-xs text-gray-600 mb-1">评估窗口 (天)</label>
+                    <input type="number" class="form-control" x-model.number="wfTest"
+                           min="5" max="250" step="10" style="width: 110px;">
+                </div>
+                <div class="text-xs text-gray-400 pb-2">
+                    预计窗口数: <b class="text-gray-600"
+                                  x-text="Math.max(0, Math.floor(((wfCount||0) - (wfTrain||0)) / Math.max(1,(wfTest||1))))"></b>
+                </div>
+            </div>
+
+            <!-- 高级: 参数候选 textarea (默认折叠) -->
+            <div x-show="wfShowAdvanced" x-cloak class="mt-3 pt-3 border-t border-gray-100">
+                <div class="flex items-center justify-between mb-1">
+                    <label class="block text-xs text-gray-600">
+                        参数候选 (每行一组, 字段顺序:
+                        <code class="text-blue-700"
+                              x-text="wfStrategyMeta()?.param_text_hint || ''"></code>)
+                    </label>
+                    <button type="button" class="text-xs text-blue-600 hover:underline"
+                            @click="wfParamGridText = (wfStrategyMeta()?.defaults_text || '')">
+                        重置该策略默认 (<span x-text="wfStrategyMeta()?.defaults_count || 0"></span> 组)
+                    </button>
+                </div>
+                <textarea class="form-control font-mono text-xs"
+                          rows="6" x-model="wfParamGridText"
+                          :placeholder="wfStrategyMeta()?.defaults_text || ''"
+                          style="font-family: ui-monospace, monospace;"></textarea>
+                <div class="text-xs text-gray-400 mt-1">
+                    候选越多, 训练期能"挑出"贴合那段历史的参数概率越大, 越容易过拟合.
+                </div>
+            </div>
+
+            <div x-show="wfError"
+                 class="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded px-2 py-1 mt-2"
+                 x-text="wfError"></div>
+        </div>
+
+        <!-- 空态 -->
+        <template x-if="!wfReport && !wfRunning">
+            <div class="card text-gray-400 text-sm py-10 text-center">
+                点右上角「运行」, 默认是宁德 × 双均线. 也可以先点上面的教学对照, 把过关和失败都跑一遍.
+            </div>
+        </template>
+
+        <!-- 结果区 -->
+        <template x-if="wfReport && wfReport.ok">
+            <div>
+                <!-- Hero verdict 横幅: 一眼看到结论 -->
+                <div class="mb-3 p-4 rounded border-l-4 flex items-start gap-3"
+                     :class="wfVerdictTone().box">
+                    <div class="text-2xl"
+                         x-text="wfVerdictTone().mark"
+                         :class="wfVerdictTone().markClass"></div>
+                    <div class="flex-1">
+                        <div class="font-bold text-base"
+                             :class="wfVerdictTone().titleClass"
+                             x-text="wfReport?.verdict_label || wfVerdictTone().title"></div>
+                        <div class="text-sm mt-1 leading-relaxed"
+                             :class="wfVerdictTone().textClass"
+                             x-text="wfReport?.verdict_text"></div>
+                    </div>
+                </div>
+
+                <!-- 4 个核心 KPI 卡 -->
+                <div class="grid grid-cols-4 gap-3 mb-3">
+                    <div class="p-3 rounded border border-gray-200 bg-gray-50">
+                        <div class="text-xs text-gray-500">平均 IS Sharpe</div>
+                        <div class="text-xl num font-bold"
+                             :class="App.pnlClass(wfReport?.summary?.avg_train_sharpe)"
+                             x-text="App.fmtNum(wfReport?.summary?.avg_train_sharpe, 2)"></div>
+                        <div class="text-xs text-gray-500">训练期 (回测看到的)</div>
+                    </div>
+                    <div class="p-3 rounded border border-gray-200 bg-gray-50">
+                        <div class="text-xs text-gray-500">平均 OOS Sharpe</div>
+                        <div class="text-xl num font-bold"
+                             :class="App.pnlClass(wfReport?.summary?.avg_test_sharpe)"
+                             x-text="App.fmtNum(wfReport?.summary?.avg_test_sharpe, 2)"></div>
+                        <div class="text-xs text-gray-500">评估期 (实盘可达的)</div>
+                    </div>
+                    <div class="p-3 rounded border border-gray-200 bg-gray-50">
+                        <div class="text-xs text-gray-500">OOS / IS 比例</div>
+                        <div class="text-xl num font-bold"
+                             :class="wfReport?.verdict === 'none' ? 'text-slate-500'
+                                     : ((wfReport?.summary?.is_oos_ratio || 0) >= 0.7 ? 'text-emerald-600'
+                                        : ((wfReport?.summary?.is_oos_ratio || 0) >= 0.5 ? 'text-amber-600' : 'text-rose-600'))"
+                             x-text="wfReport?.verdict === 'none' ? '--' : App.fmtNum(wfReport?.summary?.is_oos_ratio, 2)"></div>
+                        <div class="text-xs text-gray-500">&ge; 0.70 鲁棒 / &lt; 0.5 严重</div>
+                    </div>
+                    <div class="p-3 rounded border border-gray-200 bg-gray-50">
+                        <div class="text-xs text-gray-500">过拟合分数</div>
+                        <div class="text-xl num font-bold"
+                             :class="wfReport?.verdict === 'none' ? 'text-slate-500'
+                                     : ((wfReport?.summary?.overfit_score || 0) < 0.3 ? 'text-emerald-600'
+                                        : ((wfReport?.summary?.overfit_score || 0) < 0.7 ? 'text-amber-600' : 'text-rose-600'))"
+                             x-text="wfReport?.verdict === 'none' ? '--' : App.fmtPct(wfReport?.summary?.overfit_score, 1)"></div>
+                        <div class="text-xs text-gray-500">&lt; 30% 鲁棒 / &gt; 70% 严重</div>
+                    </div>
+                </div>
+
+                <!-- 各窗口明细 -->
+                <div class="card mb-3">
+                    <div class="card-header">
+                        <div class="card-title">各窗口明细 (IS vs OOS 对照)</div>
+                        <div class="text-xs text-gray-500"
+                             x-text="(wfReport?.summary?.windows || 0) + ' 个窗口 · 成交 IS '
+                                     + (wfReport?.summary?.train_trades ?? 0)
+                                     + ' / OOS ' + (wfReport?.summary?.test_trades ?? 0)"></div>
+                    </div>
+                    <table class="app-table mt-2">
+                        <thead><tr>
+                            <th style="width: 32px;">#</th>
+                            <th>训练期</th>
+                            <th>评估期</th>
+                            <th>训练期最优参数</th>
+                            <th class="text-right">IS Sharpe</th>
+                            <th class="text-right">OOS Sharpe</th>
+                            <th class="text-right">IS 收益</th>
+                            <th class="text-right">OOS 收益</th>
+                            <th class="text-right">IS 成交</th>
+                            <th class="text-right">OOS 成交</th>
+                        </tr></thead>
+                        <tbody>
+                            <template x-for="w in (wfReport?.windows || [])" :key="w.window_id">
+                                <tr>
+                                    <td class="text-xs num" x-text="w.window_id"></td>
+                                    <td class="text-xs" x-text="w.train"></td>
+                                    <td class="text-xs" x-text="w.test"></td>
+                                    <td class="text-xs num"
+                                        x-text="Object.entries(w.best_params || {}).map(([k,v]) => k+'='+v).join(', ')"></td>
+                                    <td class="text-right num" :class="App.pnlClass(w.train_sharpe)" x-text="App.fmtNum(w.train_sharpe, 2)"></td>
+                                    <td class="text-right num font-bold" :class="App.pnlClass(w.test_sharpe)" x-text="App.fmtNum(w.test_sharpe, 2)"></td>
+                                    <td class="text-right num" :class="App.pnlClass(w.train_ret)" x-text="App.fmtPct(w.train_ret, 2)"></td>
+                                    <td class="text-right num" :class="App.pnlClass(w.test_ret)" x-text="App.fmtPct(w.test_ret, 2)"></td>
+                                    <td class="text-right num text-xs" x-text="w.train_trades ?? '--'"></td>
+                                    <td class="text-right num text-xs" x-text="w.test_trades ?? '--'"></td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </div>
+
+                <!-- 运行参数 (折叠, 默认收起) -->
+                <details class="card text-xs text-gray-600">
+                    <summary class="cursor-pointer select-none font-semibold text-gray-700">
+                        运行参数详情
+                        <span class="text-gray-400 font-normal ml-2"
+                              x-text="(wfReport?.code) + ' · '
+                                      + (wfReport?.params?.strategy_summary || wfReport?.params?.strategy_label || '')
+                                      + ' · ' + (wfReport?.params?.elapsed_sec || 0) + 's'"></span>
+                    </summary>
+                    <div class="mt-2 leading-relaxed grid grid-cols-2 gap-x-6 gap-y-1">
+                        <div>标的: <code x-text="wfReport?.code"></code>
+                            <span x-text="wfReport?.name || ''"></span></div>
+                        <div>策略: <span x-text="wfReport?.params?.strategy_summary || wfReport?.params?.strategy_label || wfReport?.params?.strategy"></span></div>
+                        <div>数据区间: <span x-text="wfReport?.params?.first_date"></span> ~ <span x-text="wfReport?.params?.last_date"></span></div>
+                        <div>数据点 / 训练 / 评估: <span x-text="wfReport?.params?.data_rows"></span> / <span x-text="wfReport?.params?.train_window"></span> / <span x-text="wfReport?.params?.test_window"></span></div>
+                        <div>指标预热: <span x-text="wfReport?.params?.warmup"></span> 日 (窗口前的 K 线, 用来算热均线/RSI/ML)</div>
+                        <div>窗口数: <span x-text="wfReport?.summary?.windows"></span></div>
+                        <div>耗时: <span x-text="(wfReport?.params?.elapsed_sec || 0) + 's'"></span></div>
+                    </div>
+                </details>
+            </div>
+        </template>
+
+        <template x-if="wfReport && !wfReport.ok">
+            <div class="text-rose-700 bg-rose-50 border border-rose-200 rounded p-3 mt-3 text-sm"
+                 x-text="wfReport?.message"></div>
+        </template>
+
+    </div>
+    <!-- /Walk-Forward -->
+
+    <!-- 策略生命周期: 按策略 + 股票体检 -->
+    <div x-show="subTab === 'lifecycle'">
+
+        <div class="card mb-3">
+            <div class="card-header">
+                <div>
+                    <div class="card-title">策略生命周期</div>
+                    <div class="text-xs text-gray-500 font-normal mt-0.5">
+                        基于模拟盘 · 一票一策略 · 只给建议, 不改仓位.
+                        <button type="button" class="text-blue-600 hover:underline"
+                                @click="subTab = 'walkforward'">Walk-Forward</button>
+                    </div>
+                </div>
+                <div class="flex items-end gap-2 flex-wrap">
+                    <button class="btn btn-primary btn-sm" @click="evalLifecycleSim(false)" :disabled="lcSimRunning">
+                        <span x-show="!lcSimRunning">重新评估</span>
+                        <span x-show="lcSimRunning">评估中...</span>
+                    </button>
+                </div>
+            </div>
+
+            <template x-if="!lcSim && !lcSimRunning">
+                <div class="text-gray-400 text-sm py-6 text-center">评估中...</div>
+            </template>
+            <template x-if="lcSimRunning && !lcSim">
+                <div class="text-gray-400 text-sm py-6 text-center">评估中...</div>
+            </template>
+
+            <template x-if="lcSim && !lcSim.ok">
+                <div class="text-rose-700 bg-rose-50 border border-rose-200 rounded p-3 mt-3 text-sm"
+                     x-text="lcSim?.message"></div>
+            </template>
+
+            <template x-if="lcSim && lcSim.ok">
+                <div class="mt-3">
+                    <div class="lc-pipe">
+                        <template x-for="(step, idx) in (lcSim.pipeline || [])" :key="step.id">
+                            <div class="lc-pipe-cell">
+                                <div class="lc-pipe-step"
+                                     :class="{
+                                         'is-current': step.state === 'current',
+                                         'is-next':    step.state === 'next',
+                                         'is-stop':    step.state === 'stop',
+                                         'is-idle':    step.state === 'idle'
+                                     }">
+                                    <div class="lc-pipe-name" x-text="step.label"></div>
+                                    <div class="lc-pipe-hint" x-text="step.hint"></div>
+                                    <div class="lc-pipe-list">
+                                        <template x-for="it in (step.items || [])" :key="it.name + '-' + it.code">
+                                            <div class="lc-pipe-tag"
+                                                 x-text="(it.stock_name || it.code)"></div>
+                                        </template>
+                                        <div class="lc-pipe-empty" x-show="!(step.items || []).length">—</div>
+                                    </div>
+                                </div>
+                                <div class="lc-pipe-arrow" x-show="idx < (lcSim.pipeline || []).length - 1">→</div>
+                            </div>
+                        </template>
+                    </div>
+
+                    <template x-for="step in (lcSim.pipeline || [])" :key="'grp-' + step.id">
+                        <div class="mt-4" x-show="(step.items || []).length">
+                            <div class="text-sm font-semibold text-gray-800 mb-2"
+                                 x-text="step.label + ' · ' + step.hint"></div>
+                            <template x-for="st in lcBooksAt(step.id)" :key="st.name + '-' + st.code">
+                            <div class="mb-3 p-3 rounded border border-gray-200">
+                                <div class="flex items-start justify-between gap-3 flex-wrap">
+                                    <div>
+                                        <div class="font-semibold text-sm">
+                                            <span x-text="st.label"></span>
+                                            <span class="text-gray-400 font-normal"> · </span>
+                                            <span x-text="st.stock_name || st.code"></span>
+                                        </div>
+                                        <div class="text-xs text-gray-400 font-mono"
+                                             x-text="st.name + ' · ' + st.code"></div>
+                                    </div>
+                                    <div class="text-right text-xs text-gray-500">
+                                        <div>成交 <span class="num" x-text="st.orders"></span> 笔
+                                            · <span x-text="st.holding ? '持仓中' : '已清仓'"></span></div>
+                                        <div>盯市盈亏
+                                            <span class="num font-semibold"
+                                                  :class="App.pnlClass(st.pnl)"
+                                                  x-text="(st.pnl >= 0 ? '+' : '') + App.fmtNum(st.pnl, 0)"></span>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="mt-2 p-2 rounded border-l-4"
+                                     :class="st.verdict === 'promote' ? 'bg-emerald-50 border-emerald-400'
+                                           : st.verdict === 'stop'    ? 'bg-rose-50 border-rose-400'
+                                           : st.verdict === 'keep'    ? 'bg-blue-50 border-blue-400'
+                                           : 'bg-amber-50 border-amber-400'">
+                                    <div class="font-semibold text-sm"
+                                         :class="st.verdict === 'promote' ? 'text-emerald-800'
+                                               : st.verdict === 'stop'    ? 'text-rose-800'
+                                               : st.verdict === 'keep'    ? 'text-blue-800'
+                                               : 'text-amber-800'"
+                                         x-text="st.verdict_title + ' · ' + st.suggested_capital_text"></div>
+                                    <div class="text-xs mt-1 leading-relaxed"
+                                         :class="st.verdict === 'promote' ? 'text-emerald-700'
+                                               : st.verdict === 'stop'    ? 'text-rose-700'
+                                               : st.verdict === 'keep'    ? 'text-blue-700'
+                                               : 'text-amber-700'"
+                                         x-text="st.verdict_text"></div>
+                                </div>
+                                <div class="grid grid-cols-4 gap-2 mt-2">
+                                    <template x-for="g in (st.gates || [])" :key="st.name + '-' + st.code + '-' + g.key">
+                                        <div class="p-2 rounded border"
+                                             :class="!g.relevant ? 'border-gray-200 bg-gray-50'
+                                                   : g.passed ? 'border-emerald-200 bg-emerald-50'
+                                                   : 'border-amber-200 bg-amber-50'">
+                                            <div class="flex items-center justify-between gap-1">
+                                                <div class="text-xs text-gray-500" x-text="g.label"></div>
+                                                <span class="badge badge-cn"
+                                                      :class="!g.relevant ? 'badge-gray'
+                                                            : g.passed ? 'badge-success' : 'badge-warning'"
+                                                      x-text="g.relevant ? (g.passed ? '过线' : '未过') : '本档不看'"></span>
+                                            </div>
+                                            <div class="text-base num font-bold mt-0.5"
+                                                 :class="g.key === 'maxdd' ? 'text-rose-600' : App.pnlClass(g.value)"
+                                                 x-text="g.value_text"></div>
+                                            <div class="text-xs text-gray-500"
+                                                 x-text="g.relevant ? ('门槛 ' + g.threshold_text) : '本档不看'"></div>
+                                        </div>
+                                    </template>
+                                </div>
+                            </div>
+                            </template>
+                        </div>
+                    </template>
+                </div>
+            </template>
+        </div>
+    </div>
+
+</div>
+
+<script>
+function reviewApp() {
+    // 默认日期: 2026-04-01 至今 (跟模拟盘 SIM_HISTORY_START_DATE 保持一致)
+    const today = new Date();
+    const fmtDate = (d) => d.toISOString().slice(0, 10);
+
+    return {
+        showHelp: false,
+        subTab: 'brinson',
+        // ---- 交割单 CSV 文件列表 (交割单面板 + Brinson csv 数据源 共享) ----
+        csvFiles: [],                     // [{name, path, label}, ...] 由 GET /trade_csv_files 填充
+        csvPath:  '',                     // 当前选中的 CSV 绝对路径
+        // ---- 交割单 / 历史成交 (跟随 brSource 自动推导, csv 或 sim 模式才有流水) ----
+        trReport: null,                   // {ok, source, source_label, real_cost, rows, summary}
+        trError: '',
+        trRunning: false,
+        trAutoLoaded: false,              // 第一次展开时自动加载, 避免空状态
+        trOpen:    false,                 // details 折叠当前是否展开 (toggle 同步)
+        // ---- Brinson 数据 + 控制 ----
+        brSource: 'sim',                  // 'sim' | 'real' | 'csv' | 'demo' -- 默认模拟盘成交
+        brMarket: 'cn',                   // 'cn' 申万+沪深300; 'us' 美股行业等权
+        brStart: '2026-04-01',
+        brEnd:   fmtDate(today),
+        brinson: null,                    // 归因核心结果 (扁平: portfolio_return / by_industry / ...)
+        brinsonReal: null,                // 真实数据完整 response (含 positions_detail / industry_map / params)
+        brinsonError: '',
+        brinsonRunning: false,
+        indMapBusy: false,
+        // ---- Walk-Forward 过拟合检测 ----
+        wfCode:    '',
+        wfCount:   800,
+        wfTrain:   120,
+        wfTest:    60,
+        wfReport:  null,
+        wfError:   '',
+        wfRunning: false,
+        // 快捷按钮来自模拟盘账本里的全部持仓标的
+        wfPresets: [],
+        // 教学对照: 数字来自策略+股票实测, 过关和失败都有
+        wfExamples: [
+            { key: 'nd_ma',  label: '宁德 × 双均线 (OOS 仍为正)',    code: '300750.SZ', strategy: 'double_ma', count: 800, train: 120, test: 60,  tone: 'ok' },
+            { key: 'nd_ml',  label: '宁德 × ML (相对鲁棒)',         code: '300750.SZ', strategy: 'ml_prob',   count: 800, train: 300, test: 120, tone: 'ok' },
+            { key: 'cyb_bo', label: '创业板ETF × 布林 (相对鲁棒)',  code: '159915.SZ', strategy: 'bollinger', count: 800, train: 120, test: 60,  tone: 'ok' },
+            { key: 'mt_ma',  label: '茅台 × 双均线 (无正向信号)',   code: '600519.SH', strategy: 'double_ma', count: 800, train: 120, test: 60,  tone: 'none' },
+            { key: 'yh_rsi', label: '招行 × RSI (中度过拟合)',     code: '600036.SH', strategy: 'rsi',       count: 800, train: 120, test: 60,  tone: 'danger' },
+        ],
+        // 策略列表 (从 /api/review/wf_strategies 拉取, 含 key/label/description/param_text_hint/defaults_text)
+        wfStrategies: [],
+        wfStrategiesLoaded: false,
+        wfStrategy: 'double_ma',
+        // 当前策略的参数候选 textarea 内容 (策略切换时自动用 defaults_text 重置)
+        wfParamGridText: '',
+        // 是否展开"高级"区域 (参数候选编辑); 默认收起, 用默认 6 组够用 80% 场景
+        wfShowAdvanced: false,
+        // ---- 上线体检 (策略 + 股票) ----
+        lcSim: null,
+        lcSimRunning: false,
+
+        /** Alpine 生命周期 init -- 读 URL hash 决定初始 tab + 监听切换同步 hash
+         *
+         * 设计:
+         *   - hash 形如 #brinson / #walkforward / #lifecycle, F5 后 / 直接打开 URL 都能定位到指定 tab
+         *   - subTab 变化 -> 自动写 hash, 同时按 tab 跑数据加载副作用 (ensureWfStrategiesLoaded / evalLifecycleSim)
+         *     这样按钮 @click 即使不写副作用也会自动加载, 是兜底; 现有按钮的副作用调用是冗余但幂等, 保留
+         *   - 监听 hashchange -> 浏览器前进 / 后退按钮也能切 tab
+         */
+        init() {
+            const validTabs = ['brinson', 'walkforward', 'lifecycle'];
+            const applyTabSideEffects = () => {
+                if (this.subTab === 'walkforward') {
+                    this.ensureWfStrategiesLoaded();
+                    this.loadWfHoldings();
+                }
+                else if (this.subTab === 'lifecycle') this.evalLifecycleSim(true);
+            };
+            // 1) 从 hash 读初始 tab (无效 hash 走默认 brinson)
+            const initial = (location.hash || '').replace(/^#/, '');
+            if (validTabs.includes(initial)) {
+                this.subTab = initial;
+            }
+            // 2) subTab 变化 -> 同步写 hash + 加载数据
+            this.$watch('subTab', (v) => {
+                const cur = (location.hash || '').replace(/^#/, '');
+                if (cur !== v) {
+                    // 用 replaceState 避免污染浏览器历史 (每点一次 tab 不应是一个独立的"后退点")
+                    history.replaceState(null, '', '#' + v);
+                }
+                applyTabSideEffects();
+            });
+            // 3) 浏览器前进 / 后退 -> 同步切 subTab
+            window.addEventListener('hashchange', () => {
+                const h = (location.hash || '').replace(/^#/, '');
+                if (validTabs.includes(h) && h !== this.subTab) {
+                    this.subTab = h;
+                }
+            });
+            // 4) 初次进入也跑一次副作用 (默认 brinson 时无副作用; walkforward / lifecycle 时要拉数据)
+            applyTabSideEffects();
+            // 5) 原有: 拉 CSV 文件清单
+            this.loadCsvFiles();
+        },
+
+        /** 进 review 页时拉一次 CSV 文件清单 (data/ 下 历史成交_*.csv) */
+        async loadCsvFiles() {
+            try {
+                const r = await App.get('/api/review/trade_csv_files');
+                if (r && r.ok && Array.isArray(r.files) && r.files.length > 0) {
+                    this.csvFiles = r.files;
+                    if (!this.csvPath) {
+                        this.csvPath = r.default || r.files[0].path;
+                    }
+                }
+            } catch (e) { /* 静默失败, 后端默认走 DEFAULT_CSV_PATH */ }
+        },
+
+        /** 加载交割单 -- source 从 brSource 推导 (csv / sim 才有流水, real / demo 跳过) */
+        async runTradeRecord() {
+            if (this.trRunning) return;
+            if (this.brSource !== 'csv' && this.brSource !== 'sim') {
+                this.trReport = null;
+                return;
+            }
+            this.trError = '';
+            this.trRunning = true;
+            try {
+                const body = { source: this.brSource };
+                if (this.brSource === 'csv' && this.csvPath) body.csv_path = this.csvPath;
+                const r = await App.post('/api/review/trade_record', body);
+                if (r && r.ok) {
+                    this.trReport = r;
+                } else {
+                    this.trReport = null;
+                    this.trError = (r && r.message) || '加载失败';
+                }
+            } catch (e) {
+                this.trReport = null;
+                this.trError = String(e);
+            } finally {
+                this.trRunning = false;
+            }
+        },
+
+        /** details 第一次展开时自动加载一次, 避免学员看到空面板 */
+        onTradeRecordToggle(ev) {
+            this.trOpen = !!ev?.target?.open;
+            if (this.trOpen && !this.trAutoLoaded && !this.trReport) {
+                this.trAutoLoaded = true;
+                this.runTradeRecord();
+            }
+        },
+
+        /** 从文件名取出这张对账单的导出起止日 */
+        applyCsvExportRange() {
+            const f = (this.csvFiles || []).find(x => x.path === this.csvPath);
+            if (!f || !f.start || !f.end) {
+                throw new Error('交割单文件名缺少导出起止日, 无法填区间');
+            }
+            this.brStart = f.start;
+            this.brEnd = f.end;
+        },
+
+        /** CSV 文件下拉切换: 同步刷新流水 + Brinson 区间 */
+        async onCsvPathChange() {
+            // 流水面板若已展开过, 重新拉一次
+            if (this.trAutoLoaded || this.trReport) {
+                await this.runTradeRecord();
+            }
+            // Brinson csv 数据源也要刷新区间到新 CSV 的导出窗口
+            if (this.brSource === 'csv') {
+                await this.onBrSourceChange();
+            }
+        },
+
+        brSourceHint() {
+            if (this.brSource === 'demo') {
+                return '教学构造: AI 主线月重仓通信/电子, 数字事先给定, 用来手算对照公式, 不是真实持仓';
+            }
+            if (this.brMarket === 'us') {
+                return this.brSource === 'csv'
+                    ? '交割单里的美股成交 + 期末收盘盯市, 对照美股行业等权基准'
+                    : '模拟盘里的美股成交 + 期末收盘盯市, 对照美股行业等权基准';
+            }
+            return this.brSource === 'csv'
+                ? '用实盘交割单买卖流水 + 期末未平仓估值, 跟沪深300 同区间表现做对比'
+                : '用模拟盘区间内全部买卖 (含已平仓) + 期末未平仓估值, 跟沪深300 同区间表现做对比';
+        },
+
+        /** 一个统一入口: 根据 brSource 调对应接口, 把结果统一回填到 this.brinson */
+        async runBrinsonSwitch() {
+            if (this.brinsonRunning) return;
+            this.brinsonError = '';
+            this.brinsonRunning = true;
+            try {
+                if (this.brSource === 'demo') {
+                    this.brinson = await App.post('/api/review/brinson', {});
+                    this.brinsonReal = null;
+                } else {
+                    // sim / real / csv: 同一个端点, 数据源不同
+                    const body = {
+                        source: this.brSource,
+                        market: this.brMarket,
+                        benchmark: this.brMarket === 'us' ? '美股行业等权' : '沪深300',
+                        start: this.brStart,
+                        end:   this.brEnd,
+                    };
+                    if (this.brSource === 'csv' && this.csvPath) body.csv_path = this.csvPath;
+                    const r = await App.post('/api/review/brinson_real', body);
+                    if (!r || !r.ok) {
+                        this.brinson = null;
+                        this.brinsonReal = null;
+                        this.brinsonError = (r && r.message) || '归因失败';
+                        App.toast(this.brinsonError, 'danger');
+                    } else {
+                        this.brinsonReal = r;
+                        this.brinson = r.result;
+                        const tag = this.brSource === 'csv' ? '实盘交割单' : '模拟盘';
+                        App.toast(`${tag}真实数据归因完成 (${r.params.elapsed_sec}s)`, 'success');
+                    }
+                }
+            } catch (e) {
+                this.brinsonError = String(e);
+                App.toast('归因失败: ' + e, 'danger');
+            } finally {
+                this.brinsonRunning = false;
+            }
+            // 流水卡若已展开, 顺带刷新一次保持跟主结果同步 (csv / sim 模式才有流水)
+            if (this.trOpen && (this.brSource === 'csv' || this.brSource === 'sim')) {
+                this.runTradeRecord();
+            }
+        },
+
+        /** 数据源切换 -- csv 模式按文件名导出窗口填区间; 同时让流水卡跟上 */
+        async onBrSourceChange() {
+            // real / demo 模式: 流水状态清空
+            if (this.brSource !== 'csv' && this.brSource !== 'sim') {
+                this.trReport = null;
+                this.trError = '';
+                this.trAutoLoaded = false;
+                return;
+            }
+            // 切到 csv: 区间取文件名导出起止日, 不是最后一笔成交日
+            if (this.brSource === 'csv') {
+                try {
+                    this.applyCsvExportRange();
+                    App.toast(`已按交割单导出区间调整: ${this.brStart} ~ ${this.brEnd}`, 'info');
+                    if (this.trAutoLoaded || this.trReport) {
+                        await this.runTradeRecord();
+                    }
+                } catch (e) {
+                    this.brinsonError = String(e);
+                    App.toast(this.brinsonError, 'danger');
+                }
+                return;
+            }
+            // 切到 sim: 流水卡已展开过就重拉一次
+            if (this.brSource === 'sim' && (this.trAutoLoaded || this.trReport)) {
+                await this.runTradeRecord();
+            }
+        },
+
+        /** 老接口 (demo) -- 保留兼容, 暂时未在 UI 暴露 */
+        async runBrinson() {
+            this.brinsonRunning = true;
+            try {
+                this.brinson = await App.post('/api/review/brinson', {});
+            } catch (e) {
+                App.toast('归因失败: ' + e, 'danger');
+            }
+            this.brinsonRunning = false;
+        },
+
+        /** 行业明细按 |total| 降序 (一眼看到贡献最大 / 最拖后腿的行业) */
+        brinsonByIndustrySorted() {
+            const arr = (this.brinson && this.brinson.by_industry) || [];
+            return [...arr].sort((x, y) => Math.abs(y.total || 0) - Math.abs(x.total || 0));
+        },
+
+        /** 一眼读懂: 把三因子分布翻译成定性结论 (这才是 Brinson 的真正价值) */
+        brinsonHeadline() {
+            if (!this.brinson) return '';
+            const a = Number(this.brinson.allocation_effect || 0);
+            const s = Number(this.brinson.selection_effect || 0);
+            const i = Number(this.brinson.interaction_effect || 0);
+            const ex = Number(this.brinson.excess_return || 0);
+            const fmt = (v) => (v >= 0 ? '+' : '') + (v * 100).toFixed(2) + '%';
+            const head = (this.brSource === 'demo' ? '【演示】' : '') + `本期超额 ${fmt(ex)} -- `;
+            if (ex < 0) {
+                return head + '区间内跑输基准, 看下方各行业明细找拖累项';
+            }
+            const aa = Math.abs(a), as = Math.abs(s), ai = Math.abs(i);
+            const total = aa + as + ai || 1e-9;
+            const maxv = Math.max(aa, as, ai);
+            const allPositive = (a > 0 && s > 0 && i > 0);
+            // 三个因子都正向, 且最大那个 < 50% 的总贡献 -> 算均衡
+            if (allPositive && (maxv / total) < 0.5) {
+                return head + '三因子均衡正向, 配置/选股/交互都在贡献 -- 真 Alpha 信号 (可复制能力)';
+            }
+            if (ai >= aa && ai >= as) {
+                return head + '主要来自交互效应 (重仓 + 选对的叠加) -- 大概率是运气, 不可复制, 警惕过拟合';
+            }
+            if (aa >= as) {
+                return head + '主要来自配置效应 -- 赌对了赛道, 注意行业 beta 风险, 板块退潮就会打回原形';
+            }
+            return head + '主要来自选股效应 -- 真 Alpha (在选定行业里挑出了强势股)';
+        },
+
+        /** banner 配色 */
+        brinsonHeadlineClass() {
+            if (!this.brinson) return '';
+            const ex = Number(this.brinson.excess_return || 0);
+            if (ex < 0) return 'bg-rose-50 border border-rose-200 text-rose-800';
+            const a = Number(this.brinson.allocation_effect || 0);
+            const s = Number(this.brinson.selection_effect || 0);
+            const i = Number(this.brinson.interaction_effect || 0);
+            const aa = Math.abs(a), as = Math.abs(s), ai = Math.abs(i);
+            const total = aa + as + ai || 1e-9;
+            const maxv = Math.max(aa, as, ai);
+            const allPositive = (a > 0 && s > 0 && i > 0);
+            if (allPositive && (maxv / total) < 0.5) return 'bg-emerald-50 border border-emerald-200 text-emerald-800';
+            if (ai >= aa && ai >= as)                 return 'bg-amber-50 border border-amber-200 text-amber-800';
+            if (aa >= as)                              return 'bg-sky-50 border border-sky-200 text-sky-800';
+            return 'bg-emerald-50 border border-emerald-200 text-emerald-800';
+        },
+
+        /** 强制重建申万一级行业字典 cache */
+        async refreshIndustryMap() {
+            if (this.indMapBusy) return;
+            this.indMapBusy = true;
+            try {
+                const r = await App.post('/api/review/industry_map_refresh', {});
+                if (r && r.ok) {
+                    App.toast(r.message || '字典已刷新', 'success');
+                } else {
+                    App.toast((r && r.message) || '刷新失败', 'danger');
+                }
+            } catch (e) {
+                App.toast('刷新失败: ' + e, 'danger');
+            } finally {
+                this.indMapBusy = false;
+            }
+        },
+        /** 取当前选中策略的 meta (含 description / param_text_hint / defaults_text) */
+        wfStrategyMeta() {
+            return (this.wfStrategies || []).find(s => s.key === this.wfStrategy) || null;
+        },
+
+        /** 快捷标的 = 模拟盘里还持有的股票 */
+        async loadWfHoldings() {
+            try {
+                const r = await App.get('/api/review/sim_holdings');
+                const rows = (r && r.holdings) || [];
+                this.wfPresets = rows;
+                if (rows.length && !rows.some(p => p.code === this.wfCode)) {
+                    this.wfCode = rows[0].code;
+                }
+            } catch (e) {
+                this.wfError = '加载持仓标的失败: ' + e;
+            }
+        },
+
+        /** 第一次进入 Walk-Forward 子 Tab 时拉策略列表 (只拉一次, 失败给提示) */
+        async ensureWfStrategiesLoaded() {
+            if (this.wfStrategiesLoaded) return;
+            try {
+                const r = await App.get('/api/review/wf_strategies');
+                if (r && r.ok && Array.isArray(r.strategies) && r.strategies.length > 0) {
+                    this.wfStrategies = r.strategies;
+                    if (!r.strategies.find(s => s.key === this.wfStrategy)) {
+                        this.wfStrategy = r.strategies[0].key;
+                    }
+                    if (!this.wfParamGridText) {
+                        this.wfParamGridText = this.wfStrategyMeta()?.defaults_text || '';
+                    }
+                    this.wfStrategiesLoaded = true;
+                } else {
+                    this.wfError = '加载策略列表失败';
+                }
+            } catch (e) {
+                this.wfError = '加载策略列表失败: ' + e;
+            }
+        },
+
+        /** 用户切换策略时, 把 textarea 重置为该策略的默认参数候选 */
+        onWfStrategyChange() {
+            this.wfParamGridText = this.wfStrategyMeta()?.defaults_text || '';
+            this.wfReport = null;
+            this.wfError = '';
+        },
+
+        wfExampleActive(ex) {
+            return this.wfCode === ex.code
+                && this.wfStrategy === ex.strategy
+                && this.wfCount === ex.count
+                && this.wfTrain === ex.train
+                && this.wfTest === ex.test;
+        },
+
+        async applyWfExample(ex) {
+            await this.ensureWfStrategiesLoaded();
+            this.wfCode = ex.code;
+            this.wfStrategy = ex.strategy;
+            this.wfCount = ex.count;
+            this.wfTrain = ex.train;
+            this.wfTest = ex.test;
+            this.wfParamGridText = this.wfStrategyMeta()?.defaults_text || '';
+            this.wfReport = null;
+            this.wfError = '';
+        },
+
+        wfVerdictTone() {
+            const v = (this.wfReport && this.wfReport.verdict) || '';
+            if (v === 'ok') {
+                return { box: 'bg-emerald-50 border-emerald-400', mark: 'OK',
+                         markClass: 'text-emerald-600', title: '相对鲁棒',
+                         titleClass: 'text-emerald-800', textClass: 'text-emerald-700' };
+            }
+            if (v === 'warn') {
+                return { box: 'bg-amber-50 border-amber-400', mark: '!',
+                         markClass: 'text-amber-600', title: '中度过拟合',
+                         titleClass: 'text-amber-800', textClass: 'text-amber-700' };
+            }
+            if (v === 'none') {
+                return { box: 'bg-slate-50 border-slate-400', mark: '--',
+                         markClass: 'text-slate-500', title: '无正向信号',
+                         titleClass: 'text-slate-800', textClass: 'text-slate-700' };
+            }
+            return { box: 'bg-rose-50 border-rose-400', mark: 'X',
+                     markClass: 'text-rose-600', title: '严重过拟合',
+                     titleClass: 'text-rose-800', textClass: 'text-rose-700' };
+        },
+
+        /** Walk-Forward 跑一次, 把结果回填 wfReport
+         *  param_grid 以 textarea 文本送给后端, 后端按 strategy.param_cols 顺序解析每行.
+         */
+        async runWalkForward() {
+            if (this.wfRunning) return;
+            this.wfError = '';
+            this.wfRunning = true;
+            try {
+                const r = await App.post('/api/review/walk_forward', {
+                    code:       (this.wfCode || '600519.SH').trim(),
+                    count:      this.wfCount,
+                    train:      this.wfTrain,
+                    test:       this.wfTest,
+                    strategy:   this.wfStrategy,
+                    param_grid: (this.wfParamGridText || '').trim(),
+                });
+                this.wfReport = r;
+                if (r && r.ok) {
+                    const tag = r.verdict === 'ok' ? 'success'
+                              : (r.verdict === 'warn' || r.verdict === 'none' ? 'warning' : 'danger');
+                    App.toast('Walk-Forward 完成: ' + (r.verdict_label || r.verdict_text), tag);
+                } else {
+                    this.wfError = (r && r.message) || '运行失败';
+                    App.toast(this.wfError, 'danger');
+                }
+            } catch (e) {
+                this.wfError = String(e);
+                App.toast('运行失败: ' + e, 'danger');
+            } finally {
+                this.wfRunning = false;
+            }
+        },
+
+        lcBooksAt(stageId) {
+            return ((this.lcSim && this.lcSim.strategies) || [])
+                .filter((st) => st.stage_id === stageId);
+        },
+
+        /** 按策略 + 股票做上线体检. silent=true 时不弹 toast (进 Tab) */
+        async evalLifecycleSim(silent) {
+            if (this.lcSimRunning) return;
+            this.lcSimRunning = true;
+            try {
+                const r = await App.post('/api/review/lifecycle_sim_eval', {source: 'sim'});
+                this.lcSim = r;
+                if (!silent) {
+                    if (r && r.ok) {
+                        App.toast('评估完成: ' + ((r.strategies || []).length) + ' 套', 'success');
+                    } else {
+                        App.toast((r && r.message) || '评估失败', 'danger');
+                    }
+                }
+            } catch (e) {
+                if (!silent) App.toast('评估失败: ' + e, 'danger');
+                this.lcSim = {ok: false, message: String(e)};
+            } finally {
+                this.lcSimRunning = false;
+            }
+        },
+
+        /** 占位: 提示信息里的 "最近 N 个交易日" 数字, 进 tab 时若已加载 brinsonReal 则用它的, 否则给空 */
+        equityPointCount() {
+            return null;
+        },
+    }
+}
+</script>
+{% endblock %}

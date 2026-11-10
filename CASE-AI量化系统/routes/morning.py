@@ -11,6 +11,7 @@ import asyncio
 import importlib
 import json
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -27,6 +28,11 @@ CASE_D_DIR = (
     PROJECT_ROOT.parents[1]
     / "21-投资晨会-人机协作"
     / "CASE-D-投资晨会工作流"
+)
+CASE_A_DIR = (
+    PROJECT_ROOT.parents[1]
+    / "21-投资晨会-人机协作"
+    / "CASE-A-板块数据准备"
 )
 
 router = APIRouter()
@@ -119,6 +125,32 @@ class _SafeStream:
         return getattr(self._raw, name)
 
 
+def _collect_us_latest() -> str:
+    """晨会前先跑美股每日增量：续拉日 K，再重算最近 120 个交易日的板块指数。"""
+    script = CASE_A_DIR / "run_daily_us.py"
+    if not script.is_file():
+        raise FileNotFoundError(f"找不到美股增量脚本: {script}")
+    proc = subprocess.run(
+        [sys.executable, str(script), "--days", "120"],
+        cwd=str(CASE_A_DIR),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=1800,
+    )
+    output = f"{proc.stdout or ''}\n{proc.stderr or ''}"
+    if proc.returncode != 0:
+        tail = [line.strip() for line in output.splitlines() if line.strip()][-6:]
+        detail = " | ".join(tail) or f"退出码 {proc.returncode}"
+        raise RuntimeError(f"美股采集失败: {detail}")
+    span = ""
+    for line in output.splitlines():
+        if "日期范围" in line:
+            span = line.strip()
+    return span or "美股日K和板块指数已更新"
+
+
 def _prepend_case_d() -> None:
     """让 import graph / graph_us 命中 21 目录，而不是别的同名模块。"""
     if not (CASE_D_DIR / "graph.py").is_file():
@@ -168,6 +200,18 @@ async def stream(
         sys.stdout = _SafeStream(saved_out)
         sys.stderr = _SafeStream(saved_err)
         try:
+            if market == "us":
+                chunk_queue.put(("progress", {
+                    "current_node": "collect",
+                    "estimate": "Yahoo 增量日K，再重算最近 120 个交易日的板块指数",
+                    "message": "正在采集美股最新数据",
+                }))
+                summary = _collect_us_latest()
+                chunk_queue.put(("progress", {
+                    "current_node": "industry",
+                    "estimate": NODE_EST["industry"],
+                    "message": f"{summary}。开始晨会分析",
+                }))
             _prepend_case_d()
             mod_name = "graph_us" if market == "us" else "graph"
             graph = importlib.import_module(mod_name).build_graph()
@@ -185,7 +229,7 @@ async def stream(
     th.start()
 
     async def event_gen():
-        current_node = NODE_ORDER[0]
+        current_node = "collect" if market == "us" else NODE_ORDER[0]
         started_at = time.time()
 
         # 立刻发一次
@@ -193,8 +237,10 @@ async def stream(
             "event": "progress",
             "data": json.dumps({
                 "current_node": current_node,
-                "estimate":     NODE_EST.get(current_node, ""),
-                "message":      "准备启动 4 节点工作流",
+                "estimate":     ("Yahoo 增量日K，再重算最近 120 个交易日的板块指数"
+                                 if market == "us" else NODE_EST.get(current_node, "")),
+                "message":      ("正在采集美股最新数据" if market == "us"
+                                 else "准备启动 4 节点工作流"),
             }),
         }
 
@@ -207,6 +253,12 @@ async def stream(
                 )
             except queue.Empty:
                 kind, payload = None, None
+
+            if kind == "progress":
+                current_node = payload.get("current_node") or current_node
+                yield {"event": "progress", "data": json.dumps(payload, ensure_ascii=False)}
+                last_progress_at = time.time()
+                continue
 
             if kind == "update":
                 chunk = payload

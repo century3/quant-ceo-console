@@ -55,7 +55,7 @@ def _load_skill(name: str):
 
 
 def held_positions() -> list[dict]:
-    """当前模拟盘里股数大于 0 的持仓。没有运行状态时读 mock 配置。"""
+    """模拟盘账本里的全部持仓，股数为 0 的也保留。没有运行状态时读 mock 配置。"""
     rows = []
     if OUTPUTS_LIVE_STATE.is_file():
         try:
@@ -67,15 +67,16 @@ def held_positions() -> list[dict]:
         from lib.live_simulator import load_mock_config
         rows = list(load_mock_config().get("positions") or [])
     out = []
+    seen = set()
     for row in rows:
         code = str(row.get("code") or "").strip().upper()
-        volume = int(row.get("volume") or 0)
-        if not code or volume <= 0:
+        if not code or code in seen:
             continue
+        seen.add(code)
         out.append({
             "code": code,
             "name": str(row.get("name") or code),
-            "volume": volume,
+            "volume": int(row.get("volume") or 0),
         })
     return out
 
@@ -317,7 +318,7 @@ def collect_holding(position: dict, days: int) -> dict:
 
 
 def collect_holdings(days: int = 7, progress=None) -> dict:
-    """按当前模拟盘持仓逐只抓新闻。progress(item, index, total) 在每只完成后回调。"""
+    """按模拟盘账本逐只抓新闻，含股数为 0 的。progress(item, index, total) 在每只完成后回调。"""
     days = max(1, min(int(days or 7), 30))
     positions = held_positions()
     holdings = []

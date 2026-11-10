@@ -129,6 +129,8 @@ def calc_dragon_score(stock_data: dict) -> float:
 # 共振硬阈值: 板块当日涨幅 >= 0.5%, 上涨家数占比 >= 40%, 才允许进候选
 SECTOR_MIN_CHANGE_PCT = 0.005
 SECTOR_MIN_RISE_RATIO = 0.40
+# 美股价格上限。A 股仍用 30 元，两边不共用这个数。
+US_MAX_PRICE = 400.0
 
 
 def calc_sector_resonance_score(stock_data: dict) -> float:
