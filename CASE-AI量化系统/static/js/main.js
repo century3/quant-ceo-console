@@ -256,13 +256,15 @@ window.App = (function () {
       volume,
     ];
 
-    const trades = opts.trades || [];
-    const buys = trades.filter(t => t.side === 'buy');
-    const sells = trades.filter(t => t.side === 'sell');
+    // 只标当前 K 线里有的交易日。窗口外的成交若照样丢给分类轴，会被排到最后一根后面。
+    const barDates = new Set(x);
+    const onBars = (opts.trades || []).filter(t => barDates.has(String(t.date || '').slice(0, 10)));
+    const buys = onBars.filter(t => t.side === 'buy');
+    const sells = onBars.filter(t => t.side === 'sell');
     if (buys.length) {
       traces.push({
         type: 'scatter', mode: 'markers',
-        x: buys.map(t => t.date),
+        x: buys.map(t => String(t.date).slice(0, 10)),
         y: buys.map(t => t.price),
         marker: {
           color: '#dc2626', size: 11, symbol: 'triangle-up',
@@ -276,7 +278,7 @@ window.App = (function () {
     if (sells.length) {
       traces.push({
         type: 'scatter', mode: 'markers',
-        x: sells.map(t => t.date),
+        x: sells.map(t => String(t.date).slice(0, 10)),
         y: sells.map(t => t.price),
         marker: {
           color: '#059669', size: 11, symbol: 'triangle-down',
@@ -319,6 +321,8 @@ window.App = (function () {
       annotations: annotations,
       xaxis: {
         type: 'category',
+        categoryorder: 'array',
+        categoryarray: x,
         rangeslider: { visible: false },
         showgrid: false,
         tickfont: { size: 10, color: '#94a3b8' },

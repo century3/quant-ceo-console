@@ -234,8 +234,13 @@ def main():
     # 自动启动模拟盘 (后台线程, 不阻塞 uvicorn)
     _auto_start_sim()
 
-    uvicorn.run(api, host=args.host, port=actual_port,
-                log_level="info", access_log=False)
+    from data_sync.scheduler_runtime import start_embedded, stop_embedded
+    start_embedded()
+    try:
+        uvicorn.run(api, host=args.host, port=actual_port,
+                    log_level="info", access_log=False)
+    finally:
+        stop_embedded()
 
 
 if __name__ == "__main__":

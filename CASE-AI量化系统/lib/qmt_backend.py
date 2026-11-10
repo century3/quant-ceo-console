@@ -15,6 +15,10 @@ from pathlib import Path
 _MINI = ("miniqmt", "xtquant", "mini_qmt")
 _TDX = ("tdx", "mootdx", "tongdaxin")
 _SHARED = ("qmt_shared", "qmt-shared", "shared", "shared_memory", "qmt_ipc")
+_TDX_SRC_LABEL = {
+    "official": "官网日线包",
+    "local": "本机 vipdoc",
+}
 
 LABEL = {
     "qmt": "QMT",
@@ -44,10 +48,10 @@ def choices() -> list[dict]:
         {
             "id": "tdx",
             "label": "通达信",
-            "data": "本机 vipdoc 前复权日线 / 财务，入库 MySQL",
+            "data": "官网日线包（默认）或本机 vipdoc，前复权入库 MySQL",
             "trade": "不能下单",
             "can_trade": False,
-            "note": "只能做研究和模拟盘。没有资金、持仓、下单接口，实盘无法自动成交；请改用 QMT / miniQMT，或按信号到券商客户端手动下单。",
+            "note": "只能做研究和模拟盘。默认从通达信官网拉日线完整包，不用安装或打开通达信；也可切到本机 vipdoc。没有资金、持仓、下单接口，实盘请改用 QMT / miniQMT。",
         },
         {
             "id": "qmt",
@@ -131,20 +135,19 @@ def connect_tip() -> str:
     return shared_tip()
 
 
-def probe() -> dict:
-    """当前工具通不通。供健康检查和切换后提示。"""
+def probe(*, quick: bool = False) -> dict:
+    """当前工具通不通。供健康检查和切换后提示。quick=True 时共享内存只探一次。"""
     b = current()
     if b == "tdx":
-        vipdoc = Path(tdx_path()) / "vipdoc"
-        day_file = vipdoc / "sh" / "lday" / "sh600519.day"
-        ok = vipdoc.is_dir() and day_file.exists()
-        if not vipdoc.is_dir():
-            msg = f"找不到 vipdoc: {tdx_path()}"
-        elif not day_file.exists():
-            msg = "未找到日线文件"
-        else:
-            msg = f"本地 vipdoc {tdx_path()}"
-        return {"backend": b, "ok": ok, "stale": False, "message": msg}
+        from data_sync.tdx_source import probe as tdx_probe
+        p = tdx_probe()
+        return {
+            "backend": b,
+            "ok": bool(p.get("ok")),
+            "stale": bool(p.get("stale")),
+            "message": p.get("message") or "",
+            "tip": "",
+        }
     if b == "miniqmt":
         try:
             from xtquant import xtdata
@@ -154,7 +157,7 @@ def probe() -> dict:
             return {"backend": b, "ok": False, "stale": False, "message": str(e)[:160]}
     if b == "qmt_shared":
         from lib.qmt_shared import connect_tip, ping
-        p = ping()
+        p = ping(attempts=1, timeout=3) if quick else ping()
         ok = bool(p.get("ok"))
         return {
             "backend": b, "ok": ok, "stale": False,
@@ -188,6 +191,10 @@ def is_miniqmt() -> bool:
     return current() == "miniqmt"
 
 
+def is_shared() -> bool:
+    return current() == "qmt_shared"
+
+
 def can_trade() -> bool:
     return current() in ("qmt", "qmt_shared", "miniqmt")
 
@@ -200,9 +207,46 @@ def tdx_path() -> str:
     return os.environ.get("TDX_PATH", r"D:\new_tdx").strip() or r"D:\new_tdx"
 
 
+def tdx_source_mode() -> str:
+    """official=官网 hsjday.zip（默认）；local=只读本机 vipdoc。"""
+    val = os.environ.get("WUCAI_TDX_SOURCE", "official").strip().lower()
+    if val in ("local", "vipdoc", "tdx_local"):
+        return "local"
+    return "official"
+
+
+def tdx_source_choices() -> list[dict]:
+    return [
+        {
+            "id": "official",
+            "label": "官网日线包",
+            "desc": "读官网 _hsjdayinfo.js，下载 hsjday.zip 写进 vipdoc。不用安装或打开通达信。",
+        },
+        {
+            "id": "local",
+            "label": "本机 vipdoc",
+            "desc": "只读通达信已经下载好的盘后文件。软件需开着定时下载，或自己点盘后数据下载。",
+        },
+    ]
+
+
+def set_tdx_source(mode: str) -> str:
+    raw = (mode or "").strip().lower()
+    if raw in ("local", "vipdoc", "tdx_local"):
+        src = "local"
+    elif raw in ("official", "js", "hsjday", ""):
+        src = "official"
+    else:
+        raise ValueError("WUCAI_TDX_SOURCE 只接受 official / local")
+    os.environ["WUCAI_TDX_SOURCE"] = src
+    _persist_env("WUCAI_TDX_SOURCE", src)
+    return src
+
+
 def snapshot() -> dict:
     """给页面和健康检查用的一组字段。"""
     b = current()
+    src = tdx_source_mode() if b == "tdx" else ""
     return {
         "backend": b,
         "backend_label": LABEL[b],
@@ -210,7 +254,11 @@ def snapshot() -> dict:
         "can_live_quote": b in ("qmt", "qmt_shared", "miniqmt"),
         "is_tdx": b == "tdx",
         "is_miniqmt": b == "miniqmt",
+        "is_shared": b == "qmt_shared",
         "tdx_path": tdx_path() if b == "tdx" else "",
+        "tdx_source": src,
+        "tdx_source_label": _TDX_SRC_LABEL.get(src, ""),
+        "tdx_source_choices": tdx_source_choices() if b == "tdx" else [],
         "qmt_backend": LABEL[b],
         "qmt_is_mini": b == "miniqmt",
     }

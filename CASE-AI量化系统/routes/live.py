@@ -653,6 +653,15 @@ _REAL_CACHE: Dict[str, Any] = {"asset": {}, "positions": [], "orders": [],
                                 "ts": 0.0, "error": None}
 _REAL_CACHE_TTL = 5.0   # 秒
 
+
+def reset_real_trader():
+    """切换 WUCAI_QMT 后丢掉已连上的实盘 trader。"""
+    global _REAL_TRADER, _REAL_CACHE
+    _REAL_TRADER = None
+    _REAL_CACHE = {"asset": {}, "positions": [], "orders": [],
+                   "ts": 0.0, "error": None}
+
+
 # xtquant 委托状态码 -> 中文（与 xtconstant / 常见回报含义对齐）
 _ORDER_STATUS_MAP = {
     48: "未知",   49: "未报",   50: "待报",   51: "已报",

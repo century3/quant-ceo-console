@@ -6,109 +6,287 @@
 
     <button class="help-btn-floating" @click="showHelp = true" title="使用说明">?</button>
 
-    <!-- 使用说明 modal -->
     <div class="modal-overlay" x-show="showHelp" x-cloak @click.self="showHelp = false">
         <div class="modal-card">
             <div class="modal-header">
                 <div class="modal-title">系统状态 -- 使用说明</div>
-                <button class="modal-close" @click="showHelp = false">×</button>
+                <button class="modal-close" @click="showHelp = false">&times;</button>
             </div>
             <div class="modal-body">
                 <h4>这个 Tab 是干嘛的</h4>
-                <p>系统级运维面板, 一眼看出"哪个组件挂了"。还有标准 cron 时点参考。</p>
+                <p>系统级运维面板：健康检查、定时任务、以及本机 MySQL 数据下载规划。</p>
 
-                <h4>健康检查 7 项</h4>
-                <ul>
-                    <li><b>Python 版本</b> -- 运行环境</li>
-                    <li><b>xtdata 行情</b> -- 是否能拉到 K 线/tick</li>
-                    <li><b>DASHSCOPE_API_KEY</b> -- Charles 投研对话能不能用</li>
-                    <li><b>QMT_PATH</b> -- 实盘下单路径 (默认 dry-run 不需要)</li>
-                    <li><b>live_state.json</b> -- 实盘 state 文件</li>
-                    <li><b>strategy_registry.json</b> -- 策略库</li>
-                    <li><b>历史晨报</b> -- 累积了多少份</li>
-                </ul>
+                <h4>行情与交易工具</h4>
+                <p>页顶先选再保存，写入 <code>.env</code> 的 <code>WUCAI_QMT</code>。
+                   通达信只能历史数据和模拟盘，不能自动下单；QMT / miniQMT 才能实盘。
+                   切过去若没连通会提示，不会自动改回。</p>
+                <p>选通达信后还有日线来源：默认 <b>官网日线包</b>（<code>WUCAI_TDX_SOURCE=official</code>），
+                   同步时读官网 <code>_hsjdayinfo.js</code> 并下载 <code>hsjday.zip</code>，
+                   <b>不用安装或打开通达信</b>。也可切到 <b>本机 vipdoc</b>，只读客户端已经下好的盘后文件。</p>
 
-                <h4>定时任务</h4>
-                <p>实盘工作台默认 3 个时点 (周一到周五):</p>
-                <ul>
-                    <li><code>08:30</code> 数据增量（根目录 <code>.env</code> 中 <code>CASE_A_BOARD_DATA_PREP_DIR</code> 下的 <code>run_daily.py</code>）</li>
-                    <li><code>09:30</code> 开盘启动 dry-run 主循环</li>
-                    <li><code>14:55</code> 收盘前 5 分钟停主循环</li>
-                </ul>
-                <p class="text-xs text-gray-500">
-                    实现见 <code>scheduler.py</code>（APScheduler + cron）。
-                    跟 web 分进程跑: <code>python scheduler.py</code>.
-                </p>
+                <h4>数据下载怎么跑</h4>
+                <p><code>python app.py</code> 会同时拉起调度器：到点采，启动时也会检查未下完/落后的表并后台续跑
+                   （和本页「同步」同一套函数）。新闻/研报只在上次被掐断时续，其余到点再跑。
+                   <code>tdx</code> + 官网日线包：15:40 同步前会先更新 <code>vipdoc</code>。
+                   <code>tdx</code> + 本机 vipdoc：仍要自己在通达信里做盘后数据下载。</p>
+                <p>新闻、研报是全市场，会跑比较久；当日或近 7 天已采过的会跳过。</p>
+                <p>日K如果还不是前复权，页顶会提示。点「全量更新」整段重刷，大约几十分钟。刷完后每天的「同步」只追加，除权的股票才整段重下。</p>
 
-                <h4>典型场景</h4>
-                <div class="example-block">
-                    <b>场景 1 (排错)</b>: 投研对话不出回复 → 查"DASHSCOPE_API_KEY" 是不是 OK<br/><br/>
-                    <b>场景 2 (上线前自检)</b>: 启动 cron 调度前先点"健康检查", 全 OK 再跑
-                </div>
+                <h4>模拟盘 / 实盘</h4>
+                <p>主循环在 <code>app.py</code> 进程里：启动时监控池不空就开模拟盘，<code>/live</code> 页也可手点启停。
+                   调度器不在 15:00 停循环，A 股收盘后还要跑美股夜盘。实盘是 <code>/live/real</code>，同一套引擎。</p>
             </div>
         </div>
     </div>
 
-    <div class="grid-2">
-        <!-- 健康检查 -->
-        <div class="card">
-            <div class="card-header">
-                <div class="card-title">健康检查</div>
-                <button class="btn btn-primary btn-sm" @click="check()" :disabled="checking">
-                    <span x-show="!checking">健康检查</span>
-                    <span x-show="checking">检查中...</span>
+    <div class="card">
+        <div class="card-header card-header-sync">
+            <div class="sync-head-left">
+                <div class="card-title">行情与交易工具</div>
+                <div class="card-subtitle" x-text="toolHead()"></div>
+            </div>
+            <button class="btn btn-primary btn-sm" @click="saveTool()"
+                    :disabled="!toolDirty() || switching">保存</button>
+        </div>
+        <div class="tool-pick">
+            <template x-for="opt in toolChoices" :key="opt.id">
+                <button type="button" class="tool-pick-card"
+                        :class="pickedTool === opt.id ? 'active' : ''"
+                        :disabled="switching"
+                        @click="pickedTool = opt.id">
+                    <div class="tool-pick-top">
+                        <span class="tool-pick-name" x-text="opt.label"></span>
+                        <span class="tool-pick-now" x-show="currentTool() === opt.id">当前</span>
+                    </div>
+                    <div class="tool-pick-row">数据：<span x-text="opt.data"></span></div>
+                    <div class="tool-pick-row">交易：<span x-text="opt.trade"></span></div>
+                </button>
+            </template>
+        </div>
+        <div class="tdx-source-pick" x-show="pickedTool === 'tdx'">
+            <div class="tdx-source-label">通达信日线来源</div>
+            <div class="tdx-source-grid">
+                <button type="button" class="tool-pick-card"
+                        :class="pickedTdxSource === 'official' ? 'active' : ''"
+                        :disabled="switching"
+                        @click="pickedTdxSource = 'official'">
+                    <div class="tool-pick-top">
+                        <span class="tool-pick-name">官网日线包</span>
+                        <span class="tool-pick-now" x-show="currentTdxSource() === 'official'">默认</span>
+                    </div>
+                    <div class="tool-pick-row">读官网 _hsjdayinfo.js，下载 hsjday.zip。不用安装或打开通达信。</div>
+                </button>
+                <button type="button" class="tool-pick-card"
+                        :class="pickedTdxSource === 'local' ? 'active' : ''"
+                        :disabled="switching"
+                        @click="pickedTdxSource = 'local'">
+                    <div class="tool-pick-top">
+                        <span class="tool-pick-name">本机 vipdoc</span>
+                        <span class="tool-pick-now" x-show="currentTdxSource() === 'local'">当前</span>
+                    </div>
+                    <div class="tool-pick-row">只读通达信已经下载好的盘后文件。</div>
                 </button>
             </div>
-            <template x-if="!health || health.length === 0">
-                <div class="text-gray-400 text-sm py-6 text-center">点右上按钮跑一次</div>
-            </template>
-            <template x-if="health && health.length > 0">
-                <table class="app-table">
-                    <thead><tr><th>项</th><th>值</th><th>状态</th></tr></thead>
-                    <tbody>
-                        <template x-for="r in health" :key="r.item">
-                            <tr>
-                                <td x-text="r.item"></td>
-                                <td class="text-xs text-gray-600 font-mono" x-text="r.value"></td>
-                                <td>
-                                    <span class="badge"
-                                          :class="r.status === 'OK' ? 'badge-success' :
-                                                  r.status === 'WARN' ? 'badge-warning' : 'badge-danger'"
-                                          x-text="r.status"></span>
-                                </td>
-                            </tr>
-                        </template>
-                    </tbody>
-                </table>
+        </div>
+        <div class="tool-note" :class="pickedCanTrade() ? 'tool-note-info' : 'tool-note-warn'"
+             x-show="pickedNote()" x-text="pickedNote()"></div>
+    </div>
+
+    <!-- 主区：四张表状态一眼可见 -->
+    <div class="card mt-4">
+        <div class="card-header card-header-sync">
+            <div class="sync-head-left">
+                <div class="card-title">数据下载</div>
+                <div class="card-subtitle sync-head-status"
+                     :class="headTone()"
+                     x-text="downloadHead()"></div>
+            </div>
+            <div class="sync-head-actions">
+                <button class="btn btn-primary btn-sm" @click="startTask('all')"
+                        :disabled="!canStart">全部同步</button>
+                <button class="btn btn-secondary btn-sm" @click="stopTask()"
+                        :disabled="!job.running">停止</button>
+            </div>
+        </div>
+
+        <template x-if="inv.tool && inv.tool.is_tdx && currentTdxSource() === 'official' && (inv.vipdoc_stale || !inv.vipdoc_last_date)">
+            <div class="qfq-banner">
+                <div>
+                    本地日线停在 <b x-text="inv.vipdoc_last_date || '空'"></b>。
+                    当前是官网日线包模式，点「全部同步」或等 15:40，系统会从通达信官网自动更新，
+                    <b>不用打开通达信</b>。
+                </div>
+            </div>
+        </template>
+        <template x-if="inv.tool && inv.tool.is_tdx && currentTdxSource() === 'local' && (inv.vipdoc_stale || !inv.source_ok)">
+            <div class="qfq-banner">
+                <div>
+                    本地日线停在 <b x-text="inv.vipdoc_last_date || '空'"></b>，系统只能读已经下到硬盘的文件。
+                    请打开通达信 → <b>功能</b> → <b>勾选功能树</b> → 左侧 <b>系统工具</b> → <b>盘后数据下载</b>
+                    → 勾选沪深日线 → 下到最近交易日，然后点「全部同步」。
+                    财务季报由系统自动下载，不用再点终端。
+                </div>
+            </div>
+        </template>
+
+        <template x-if="inv.tool && inv.tool.is_shared && !inv.source_ok">
+            <div class="qfq-banner">
+                <div>
+                    <b>TIPS</b>　<span x-text="inv.source_tip || 'QMT共享内存未连通。请先在已登录的大 QMT 里运行本项目 data_sync/qmt_gateway_loader.py。'"></span>
+                </div>
+            </div>
+        </template>
+
+        <template x-if="inv.qfq && inv.qfq.pending > 0">
+            <div class="qfq-banner">
+                <div>
+                    日K还不是前复权：<span x-text="fmtInt(inv.qfq.stocks)"></span> 只里还有
+                    <span x-text="fmtInt(inv.qfq.pending)"></span> 只没刷过。
+                    全量更新大约 <span x-text="inv.qfq.eta_min"></span> 到
+                    <span x-text="inv.qfq.eta_max"></span> 分钟。
+                    刷完以后每天只追加新的一天，只有除权的股票才整段重下。
+                </div>
+                <button class="btn btn-primary btn-sm" @click="startTask('qfq_full')"
+                        :disabled="!canStart || !inv.source_ok">全量更新</button>
+            </div>
+        </template>
+
+        <div class="sync-summary">
+            <template x-for="t in (inv.core || [])" :key="'sum-'+t.name">
+                <div class="sync-summary-card" :class="'fresh-' + t.fresh">
+                    <div class="sync-summary-top">
+                        <span class="sync-summary-name" x-text="t.label"></span>
+                        <span class="badge badge-cn" :class="freshCls(t.fresh)" x-text="freshText(t.fresh)"></span>
+                    </div>
+                    <div class="sync-summary-date" x-text="cardMain(t)"></div>
+                    <div class="sync-summary-meta">
+                        <span x-text="entityText(t)"></span>
+                        <span x-text="fmtInt(t.row_count) + ' 行'"></span>
+                    </div>
+                </div>
             </template>
         </div>
 
-        <!-- 定时任务 cron -->
+        <div class="legend-bar">
+            <span class="legend-item"><span class="badge badge-cn badge-fresh">已最新</span>对齐最近交易日/报告期</span>
+            <span class="legend-item"><span class="badge badge-cn badge-running">运行中</span>正在写入</span>
+            <span class="legend-item"><span class="badge badge-cn badge-warn">落后</span>需要增量</span>
+            <span class="legend-item"><span class="badge badge-cn badge-stale">失败</span>出错或过期</span>
+            <span class="legend-item"><span class="badge badge-cn badge-idle">空表</span>还没写过</span>
+        </div>
+
+        <template x-if="job.running">
+            <div class="sync-progress">
+                <div class="sync-progress-meta">
+                    <span x-text="job.message || '同步中'"></span>
+                    <span class="text-gray-400"
+                          x-text="(job.current||0) + '/' + (job.total||0)
+                                  + '  成功 ' + (job.success||0)
+                                  + '  失败 ' + (job.failed||0)
+                                  + '  写入 ' + (job.rows_written||0)"></span>
+                </div>
+                <div class="sync-bar">
+                    <div class="sync-bar-fill" :style="'width:' + progressPct() + '%'"></div>
+                </div>
+            </div>
+        </template>
+        <template x-if="!job.running && job.message">
+            <div class="sync-last text-xs text-gray-500"
+                 x-text="(job.finished_at ? job.finished_at + '  ' : '') + job.message"></div>
+        </template>
+
+        <table class="app-table data-sync-table">
+            <thead>
+                <tr>
+                    <th>任务</th>
+                    <th>调度</th>
+                    <th>状态</th>
+                    <th>关联表</th>
+                    <th>表最新</th>
+                    <th>数量</th>
+                    <th>行数</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>
+                <template x-for="t in (inv.tasks || [])" :key="t.name">
+                    <tr>
+                        <td>
+                            <div class="td-label" x-text="t.label"></div>
+                            <div class="text-xs text-gray-400" x-text="t.hint || ''"></div>
+                        </td>
+                        <td class="nowrap text-xs text-gray-500" x-text="t.cron"></td>
+                        <td class="nowrap">
+                            <span class="badge badge-cn" :class="freshCls(t.fresh)" x-text="freshText(t.fresh)"></span>
+                            <span class="text-xs text-gray-400" x-show="t.lag_days > 0"
+                                  x-text="'落后 ' + t.lag_days + ' 天'"></span>
+                        </td>
+                        <td class="font-mono text-xs nowrap" x-text="t.table"></td>
+                        <td class="nowrap text-xs" x-text="latestText(t)"></td>
+                        <td class="num" x-text="countText(t)"></td>
+                        <td class="num" x-text="fmtInt(t.row_count)"></td>
+                        <td>
+                            <button class="btn btn-secondary btn-sm"
+                                    @click="startTask(t.name)"
+                                    :disabled="!canStartTask(t)"
+                                    x-text="t.name === 'sector' ? '合成' : '同步'"></button>
+                        </td>
+                    </tr>
+                </template>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="grid-equal mt-4">
+        <div class="card">
+            <div class="card-header">
+                <div class="card-title">健康检查</div>
+                <button class="btn btn-primary btn-sm" @click="check()" :disabled="checking || switching">
+                    <span x-show="!checking">刷新</span>
+                    <span x-show="checking">检查中...</span>
+                </button>
+            </div>
+            <template x-if="healthError">
+                <div class="qfq-banner" x-text="healthError"></div>
+            </template>
+            <table class="app-table" x-show="health.length > 0">
+                <thead><tr><th>项</th><th>值</th><th>状态</th></tr></thead>
+                <tbody>
+                    <template x-for="r in health" :key="r.item">
+                        <tr>
+                            <td class="nowrap" x-text="r.item"></td>
+                            <td class="text-xs text-gray-600 font-mono" x-text="r.value"></td>
+                            <td>
+                                <span class="badge"
+                                      :class="r.status === 'OK' ? 'badge-success' :
+                                              r.status === 'WARN' ? 'badge-warning' : 'badge-danger'"
+                                      x-text="r.status"></span>
+                            </td>
+                        </tr>
+                    </template>
+                </tbody>
+            </table>
+            <div class="text-gray-400 text-sm py-6 text-center"
+                 x-show="!checking && health.length === 0 && !healthError">还没有检查结果</div>
+        </div>
+
         <div class="card">
             <div class="card-header">
                 <div class="card-title">定时任务</div>
-                <div class="card-subtitle">实盘工作台默认 3 个时点</div>
+                <div class="card-subtitle" x-text="schedulerLine()"></div>
             </div>
-            <table class="app-table">
-                <thead><tr>
-                    <th>时间</th><th>动作</th><th>说明</th>
-                </tr></thead>
-                <tbody>
-                    <tr><td class="num">08:30</td><td>数据增量</td>
-                        <td>按 <code>CASE_A_BOARD_DATA_PREP_DIR</code> 调用 <code>run_daily.py</code> 拉昨日 K 线 + 板块指数</td></tr>
-                    <tr><td class="num">09:30</td><td>启动主循环</td>
-                        <td>开盘启动 dry-run 模拟盘 (每分钟巡检一次)</td></tr>
-                    <tr><td class="num">14:55</td><td>停止主循环</td>
-                        <td>收盘前 5 分钟停, 避免空转</td></tr>
-                </tbody>
-            </table>
-            <div class="text-xs text-gray-500 mt-3 leading-relaxed">
-                <b>启动方法</b> (跟 web 工作台分两个进程跑, 互不影响):<br/>
-                <code class="text-xs" style="color:#7c3aed;">
-                    cd 22-实盘作战与CEO控制台\CASE-AI量化系统<br/>
-                    python scheduler.py
-                </code><br/>
-                <span class="text-gray-400">单文件 APScheduler，周一到周五自动触发，Ctrl+C 退出；想立刻验证可加 <code>--simulate</code>。</span>
+            <div class="cron-list">
+                <template x-for="c in (inv.timeline || [])" :key="c.time + c.action">
+                    <div class="cron-item">
+                        <div class="cron-time" x-text="c.time"></div>
+                        <div>
+                            <div class="cron-action" x-text="c.action"></div>
+                            <div class="cron-desc" x-text="c.desc"></div>
+                            <div class="cron-desc text-gray-400" x-show="c.next_run"
+                                 x-text="'下次 ' + c.next_run"></div>
+                        </div>
+                    </div>
+                </template>
             </div>
         </div>
     </div>
@@ -117,15 +295,234 @@
 
 <script>
 function systemApp() {
+    const FRESH_TEXT = {
+        fresh: '已最新', running: '运行中', warn: '落后',
+        stale: '失败', idle: '空表', unknown: '未知',
+    };
+    const FRESH_CLS = {
+        fresh: 'badge-fresh', running: 'badge-running', warn: 'badge-warn',
+        stale: 'badge-stale', idle: 'badge-idle', unknown: 'badge-gray',
+    };
     return {
         showHelp: false,
-        health: null,
+        health: [],
+        healthError: '',
         checking: false,
-        async init() { await this.check(); },
+        switching: false,
+        pickedTool: '',
+        pickedTdxSource: 'official',
+        toolChoices: [
+            {id: 'tdx', label: '通达信', data: '官网日线包（默认）或本机 vipdoc，前复权入库 MySQL',
+             trade: '不能下单', can_trade: false,
+             note: '只能做研究和模拟盘。默认从通达信官网拉日线完整包，不用安装或打开通达信；也可切到本机 vipdoc。没有资金、持仓、下单接口，实盘请改用 QMT / miniQMT。'},
+            {id: 'qmt', label: 'QMT', data: 'QMT HTTP 桥：前复权日线 + 盘中行情',
+             trade: '可实盘下单', can_trade: true,
+             note: '需要 QMT 已登录，并在 QMT 里跑 CY_QMT_API（本机 15588）。'},
+            {id: 'qmt_shared', label: 'QMT共享内存', data: '共享内存：前复权日线 + 财务 + 盘中行情',
+             trade: '可实盘下单', can_trade: true,
+             note: '需要 QMT 已登录，并在 QMT 里把本项目 data_sync/qmt_gateway_loader.py 当成策略跑起来；账户查询和下单还需在 .env 配置 ACCOUNT_ID，不使用 15588 HTTP 服务。'},
+            {id: 'miniqmt', label: 'miniQMT', data: 'xtquant：前复权日线 + 盘中行情',
+             trade: '可实盘下单', can_trade: true,
+             note: '需要本机 miniQMT 运行，并在 .env 填 QMT_PATH / ACCOUNT_ID。'},
+        ],
+        inv: { source_ok: false, tasks: [], source_message: '', scheduler: {}, tool: {} },
+        job: { running: false },
+        pollTimer: null,
+        downloadHead() {
+            const tool = (this.inv.tool && this.inv.tool.backend_label) || '工具';
+            if (this.inv.tool && this.inv.tool.is_tdx) {
+                const day = this.inv.vipdoc_last_date || '-';
+                const src = this.currentTdxSource() === 'local' ? '本机 vipdoc' : '官网日线包';
+                if (!this.inv.source_ok) return tool + ' 未就绪';
+                if (this.inv.vipdoc_stale) return tool + ' · ' + src + ' ' + day + ' · 落后';
+                return tool + ' · ' + src + ' ' + day;
+            }
+            const day = this.inv.last_trade_date || '-';
+            if (!this.inv.source_ok) return tool + ' 未连接';
+            return tool + ' · 最近交易日 ' + day;
+        },
+        headTone() {
+            if (!this.inv.source_ok) return 'sync-head-bad';
+            if (this.inv.tool && this.inv.tool.is_tdx && this.inv.vipdoc_stale) return 'sync-head-bad';
+            return 'sync-head-ok';
+        },
+        currentTool() {
+            return (this.inv.tool && this.inv.tool.backend) || '';
+        },
+        currentTdxSource() {
+            return (this.inv.tool && this.inv.tool.tdx_source) || 'official';
+        },
+        pickedOpt() {
+            return this.toolChoices.find(o => o.id === this.pickedTool) || null;
+        },
+        toolDirty() {
+            if (!this.pickedTool) return false;
+            if (this.pickedTool !== this.currentTool()) return true;
+            if (this.pickedTool === 'tdx' && this.pickedTdxSource !== this.currentTdxSource()) return true;
+            return false;
+        },
+        toolHead() {
+            const cur = this.toolChoices.find(o => o.id === this.currentTool());
+            const name = (cur && cur.label) || '未设置';
+            const src = this.currentTool() === 'tdx'
+                ? ' · ' + (this.currentTdxSource() === 'local' ? '本机 vipdoc' : '官网日线包')
+                : '';
+            if (this.toolDirty()) {
+                const next = this.pickedOpt();
+                return '当前生效：' + name + src + '。已改选项，点保存写入 .env';
+            }
+            return '当前生效：' + name + src + '（WUCAI_QMT=' + (this.currentTool() || '-') + '）';
+        },
+        pickedNote() {
+            const opt = this.pickedOpt();
+            return opt ? opt.note : '';
+        },
+        pickedCanTrade() {
+            const opt = this.pickedOpt();
+            return !!(opt && opt.can_trade);
+        },
+        schedulerLine() {
+            const s = this.inv.scheduler || {};
+            if (!s.running) return s.message || '调度器未启动，请重启 app.py';
+            if (s.started_at) return (s.message || '调度器已随 app.py 启动') + '  ·  ' + s.started_at;
+            return s.message || '调度器已随 app.py 启动';
+        },
+        get canStart() {
+            return !this.job.running;
+        },
+        canStartTask(t) {
+            if (!t.can_sync || this.job.running) return false;
+            if (t.needs_qmt) return !!this.inv.source_ok;
+            return true;
+        },
+        entityText(t) {
+            if (t.name === 'sector') return this.fmtInt(t.stock_count) + ' 板块';
+            if (t.entity_field === 'stock_code' && t.stock_count) return this.fmtInt(t.stock_count) + ' 只';
+            return '';
+        },
+        countText(t) {
+            if (!t.entity_field) return '-';
+            return this.fmtInt(t.stock_count);
+        },
+        latestText(t) {
+            if (t.max_date) return t.max_date;
+            if (t.expected_date) return '期望 ' + t.expected_date;
+            return '';
+        },
+        freshText(s) { return FRESH_TEXT[s] || s || '-'; },
+        freshCls(s) { return FRESH_CLS[s] || 'badge-gray'; },
+        cardMain(t) {
+            if (t.max_date) return t.max_date;
+            if (t.stock_count) return this.fmtInt(t.stock_count);
+            return '空表';
+        },
+        fmtInt(n) {
+            if (n === null || n === undefined) return '-';
+            return Number(n).toLocaleString('zh-CN');
+        },
+        progressPct() {
+            const t = this.job.total || 0;
+            if (!t) return 6;
+            return Math.min(100, Math.round((this.job.current || 0) * 100 / t));
+        },
+        async init() {
+            await this.check();
+            await this.refreshInv();
+            this.pickedTool = this.currentTool();
+            this.pickedTdxSource = this.currentTdxSource();
+            this.tick();
+        },
+        applyHealth(data) {
+            if (data && Array.isArray(data.rows)) {
+                this.health = data.rows;
+                this.healthError = '';
+                if (data.choices && data.choices.length) this.toolChoices = data.choices;
+                if (data.tool && this.inv) this.inv.tool = data.tool;
+                if (!this.pickedTool) this.pickedTool = this.currentTool();
+                if (this.pickedTool === 'tdx' && this.pickedTool === this.currentTool() && !this.toolDirty()) {
+                    this.pickedTdxSource = this.currentTdxSource();
+                }
+                return;
+            }
+            this.health = [];
+            if (data && data.detail) {
+                this.healthError = typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail);
+            } else {
+                this.healthError = '健康检查无数据';
+            }
+        },
         async check() {
             this.checking = true;
-            this.health = await App.get('/api/system/health');
+            this.healthError = '';
+            const data = await App.get('/api/system/health');
+            this.applyHealth(data);
             this.checking = false;
+        },
+        async saveTool() {
+            if (!this.toolDirty() || this.switching) return;
+            this.switching = true;
+            const r = await App.post('/api/system/tool', {
+                backend: this.pickedTool,
+                tdx_source: this.pickedTool === 'tdx' ? this.pickedTdxSource : undefined,
+            });
+            this.switching = false;
+            if (!r || r.ok === false) {
+                App.toast((r && r.message) || '保存失败', 'error');
+                return;
+            }
+            this.applyHealth(r);
+            await this.refreshInv();
+            this.pickedTool = this.currentTool();
+            this.pickedTdxSource = this.currentTdxSource();
+            const name = (r.tool && r.tool.backend_label) || this.pickedTool;
+            if (r.connected) {
+                App.toast('已保存为 ' + name, 'success');
+            } else {
+                App.toast('已保存为 ' + name + '，但未连通。' + (r.tip || r.message || ''), 'error');
+            }
+        },
+        async refreshInv() {
+            const data = await App.get('/api/system/data/inventory');
+            if (data && data.tasks) {
+                this.inv = data;
+                this.job = data.job || { running: false };
+                if (!this.pickedTool) this.pickedTool = this.currentTool();
+            }
+        },
+        async refreshJob() {
+            const data = await App.get('/api/system/data/status');
+            if (data) this.job = data;
+        },
+        tick() {
+            if (this.pollTimer) clearTimeout(this.pollTimer);
+            const wait = this.job.running ? 1500 : 8000;
+            this.pollTimer = setTimeout(async () => {
+                const wasRunning = !!this.job.running;
+                if (wasRunning) {
+                    await this.refreshJob();
+                    if (!this.job.running) await this.refreshInv();
+                } else {
+                    await this.refreshInv();
+                }
+                this.tick();
+            }, wait);
+        },
+        async startTask(task) {
+            const r = await App.post('/api/system/data/start', { task });
+            if (r && r.ok === false) {
+                App.toast(r.message || '启动失败', 'error');
+                return;
+            }
+            this.job = (r && r.job) || { running: true, task, message: '已启动' };
+            this.tick();
+        },
+        async stopTask() {
+            const r = await App.post('/api/system/data/stop', {});
+            if (r && r.ok === false) {
+                App.toast(r.message || '停止失败', 'error');
+                return;
+            }
+            await this.refreshInv();
         },
     }
 }

@@ -2401,12 +2401,34 @@ function liveApp() {
                 .filter(t => t.date && t.price > 0);
         },
 
+        chartMarksForCode(code, bars) {
+            // 三角标信号日。已持仓时买入不再成交，但信号表里仍有这一天。
+            const c = (code || '').trim();
+            const closeByDate = {};
+            (bars || []).forEach(b => { closeByDate[b.date] = Number(b.close) || 0; });
+            const marks = new Map();
+            this.tradesForCode(c).forEach(t => {
+                marks.set(t.date + '|' + t.side, t);
+            });
+            (this.state.signals || []).forEach(s => {
+                if (!s || s.code !== c || (s.side !== 'buy' && s.side !== 'sell')) return;
+                const date = String(s.ts || '').slice(0, 10);
+                const key = date + '|' + s.side;
+                if (!date || marks.has(key)) return;
+                const price = closeByDate[date] || 0;
+                if (price <= 0) return;
+                marks.set(key, { date, side: s.side, price });
+            });
+            return Array.from(marks.values());
+        },
+
         renderKlineChart() {
-            // 与回测页共用 App.renderStockKline; 买卖点来自 4-1 以来的成交
+            // 与回测页共用 App.renderStockKline; 三角含成交和未成交的信号
+            const bars = this.klineModal.bars || [];
             App.renderStockKline('live-kline-chart', {
-                bars: this.klineModal.bars || [],
+                bars: bars,
                 cost: this.klineModal.cost || 0,
-                trades: this.tradesForCode(this.klineModal.code),
+                trades: this.chartMarksForCode(this.klineModal.code, bars),
             });
         },
 

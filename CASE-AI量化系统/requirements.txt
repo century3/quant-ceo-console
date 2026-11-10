@@ -28,3 +28,4 @@ pymysql>=1.1.0          # 晨会 morning_brief 读 wucai_trade
 pyyaml>=6.0
 chinese-calendar>=1.10.0
 apscheduler>=3.10.0
+mootdx>=0.11.0          # 通达信官网日线包 / 本机 vipdoc；安装时不要降级 httpx、tenacity

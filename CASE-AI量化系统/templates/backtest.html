@@ -80,8 +80,12 @@
                     <div>
                         <label class="block text-xs text-gray-600 mb-1">策略</label>
                         <select class="form-control" x-model="form.strategy">
-                            <template x-for="s in strategies" :key="s.name">
-                                <option :value="s.name" x-text="s.label"></option>
+                            <template x-for="g in strategyGroups" :key="'btg-' + g.name">
+                                <optgroup :label="g.name">
+                                    <template x-for="s in g.items" :key="s.name">
+                                        <option :value="s.name" x-text="s.display || ('[' + s.group + '] ' + s.label)"></option>
+                                    </template>
+                                </optgroup>
                             </template>
                         </select>
                     </div>
@@ -440,6 +444,7 @@ function backtestApp() {
         showHelp: false,
         ping: null,
         strategies: [],
+        strategyGroups: [],
         form: {
             code: '沪硅产业(688126.SH)',
             start: fmt(oneYearAgo),
@@ -462,6 +467,9 @@ function backtestApp() {
             try {
                 const sres = await App.get('/api/backtest/strategies');
                 this.strategies = (sres && sres.list) ? sres.list : [];
+                this.strategyGroups = Object.entries((sres && sres.groups) || {}).map(
+                    ([name, items]) => ({ name, items })
+                );
                 if (this.strategies.length > 0
                         && !this.strategies.find(s => s.name === this.form.strategy)) {
                     this.form.strategy = this.strategies[0].name;
