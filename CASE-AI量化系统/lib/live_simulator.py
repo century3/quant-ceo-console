@@ -369,13 +369,38 @@ def replay_sim_fills(
     )
     if all_sigs:
         book = load_mock_config()
-        positions, orders = apply_history_fills(
+        positions, orders, skipped = apply_history_fills(
             start_positions, capital, all_sigs, kline_map,
             int(book["max_slots"]), list(book["slot_codes"]),
         )
+        all_sigs = _drop_skipped_signals(all_sigs, skipped)
     else:
         positions, orders = list(start_positions or []), []
     return positions, opening + orders, all_sigs
+
+
+def _drop_skipped_signals(signals: List[dict], skipped: set) -> List[dict]:
+    """去掉没有成交的同价卖出，避免 K 线上仍标出这个三角。"""
+    if not skipped:
+        return signals
+    kept = []
+    for sig in signals:
+        key = (
+            str(sig.get("code") or ""),
+            str(sig.get("ts") or "")[:10],
+            sig.get("side"),
+        )
+        if key in skipped:
+            continue
+        kept.append(sig)
+    return kept
+
+
+def _open_cost(positions: List[dict], code: str) -> float:
+    for p in positions:
+        if str(p.get("code") or "") == code and int(p.get("volume") or 0) > 0:
+            return float(p.get("cost") or 0)
+    return 0.0
 
 
 def apply_history_fills(
@@ -385,21 +410,24 @@ def apply_history_fills(
     kline_map: Dict[str, List[dict]],
     max_slots: int,
     slot_codes: List[str],
-) -> Tuple[List[dict], List[dict]]:
+) -> Tuple[List[dict], List[dict], set]:
     """按时间顺序把历史 buy/sell 写进持仓.
 
     - sell: 有仓就卖光, 行留下 volume=0, 策略继续盯, 档还在
+    - 概率择时的卖出价离成本不到 3% 时不卖, 避免 307 买、307.5 卖
     - buy: 仅已分档且空仓时开, 金额 = 每档目标
     """
     from live_trading.live_loop import (
         apply_dry_run_fill, _held_volume, _available_cash,
         share_lot, size_buy_shares, slot_budget,
     )
+    from lib.strategy_registry import ml_roundtrip_too_small
 
     slotted = set(slot_codes or [])
     budget = slot_budget(capital, max_slots)
     positions = [dict(p) for p in (positions or [])]
     orders: List[dict] = []
+    skipped: set = set()
     for sig in signals:
         code = str(sig.get("code") or "")
         side = sig.get("side")
@@ -412,6 +440,10 @@ def apply_history_fills(
         held = _held_volume(positions, code)
         if side == "sell":
             if held <= 0:
+                continue
+            cost = _open_cost(positions, code)
+            if ml_roundtrip_too_small(str(sig.get("strategy") or ""), cost, price):
+                skipped.add((code, day, "sell"))
                 continue
             qty = held
             positions = apply_dry_run_fill(positions, code, "sell", qty, price)
@@ -440,7 +472,7 @@ def apply_history_fills(
             "strategy": sig.get("strategy", ""),
             "reason": "历史回放成交",
         })
-    return positions, orders
+    return positions, orders, skipped
 
 
 # ============================================================
@@ -507,6 +539,32 @@ def market_is_open(code: str, now: Optional[datetime] = None) -> bool:
     if str(code).upper().endswith(".US"):
         return is_us_trading_hour(now)
     return is_a_share_trading_hour(now)
+
+
+def is_beijing_daytime(now: Optional[datetime] = None) -> bool:
+    """北京时间工作日 09:30–21:00。这段时间用日 K 算美股信号，不等美东开盘。"""
+    now = now or datetime.now()
+    if now.weekday() >= 5:
+        return False
+    from datetime import time as dt_time
+    t = now.time()
+    return dt_time(9, 30) <= t < dt_time(21, 0)
+
+
+def cycle_codes(watch_stocks, now: Optional[datetime] = None):
+    """本轮要评估的代码，以及其中允许下单的代码。
+
+    开盘的市场照常算信号并模拟成交。美股没开盘时，北京时间白天仍用最新日 K 算信号，不下单。
+    """
+    tradable = [c for c in watch_stocks if market_is_open(c, now)]
+    tradable_set = set(tradable)
+    signal_only = []
+    if is_beijing_daytime(now):
+        signal_only = [
+            c for c in watch_stocks
+            if str(c).upper().endswith(".US") and c not in tradable_set
+        ]
+    return tradable + signal_only, tradable
 
 
 def load_mock_config() -> dict:
@@ -641,6 +699,7 @@ class LiveSimRunner:
         self._dry_run = True
         self._router = None        # StrategyRouter -- 启动后才创建
         self._last_watch_stocks: Optional[List[str]] = None  # 最近一次启动时的合并监控列表
+        self._starting = False
 
     # ------------------------------------------------------------------
     def status(self) -> dict:
@@ -672,14 +731,10 @@ class LiveSimRunner:
         """
         if self._thread is not None and self._thread.is_alive():
             return "[INFO] 模拟盘已在运行, 请先停止"
+        if self._starting:
+            return "[INFO] 正在启动, 美股日K和历史回放在后台进行"
 
-        # 回放信号前先补美股日K，否则金叉死叉停在库里的最后一根
-        try:
-            from lib.us_daily_sync import sync_watch_us_daily
-            sync_watch_us_daily(watch_stocks)
-        except Exception as e:
-            print(f"[us] 启动补齐美股日K失败 (不影响模拟盘启动): {type(e).__name__}: {e}", flush=True)
-
+        self._starting = True
         from lib.paths import OUTPUTS_LIVE_STATE, setup_sys_path
         setup_sys_path()
         from live_trading.live_loop import LiveTradingLoop
@@ -708,6 +763,7 @@ class LiveSimRunner:
             )
             self._dry_run = dry_run
         except Exception as e:
+            self._starting = False
             return f"[ERROR] 创建 LiveTradingLoop 失败: {e}"
 
         # 初始化持仓 (从配置)
@@ -734,32 +790,14 @@ class LiveSimRunner:
             print(f"[WARN] 启动时重算 today_pnl 失败: {e}", flush=True)
         self._loop.state_store.save(s)
 
-        # 历史信号回放: 信号表为空时, 把每只监控股票从 SIM_HISTORY_START_DATE
-        # 至今的策略 buy/sell 信号回放进 state.signals, 用户首次打开就能看到历史
-        # 失败不阻塞 start (回测引擎/MySQL/数据缺失都属于非致命)
-        try:
-            self._seed_historical_signals_if_empty(watch_stocks)
-        except Exception as e:
-            print(f"[WARN] 历史信号回放失败 (不影响主流程): {e}", flush=True)
-
-        # 历史资金曲线回放: 资金曲线没"今天之前的点"时, 把 [start_date, 昨天] 每个交易日
-        # 按 mock_positions buy-and-hold 算的总资产% 写进 state.pnl_history,
-        # 让"资金曲线"图启动就能看到 4-1 至今的趋势, 而不是只有今天那一段
-        try:
-            self._seed_historical_pnl_curve_if_empty()
-        except Exception as e:
-            print(f"[WARN] 历史资金曲线回放失败 (不影响主流程): {e}", flush=True)
-        try:
-            self._seed_today_intraday_curve()
-        except Exception as e:
-            print(f"[WARN] 当日分时回放失败 (不影响主流程): {e}", flush=True)
-
-        # 启动 worker
+        # 启动 worker。美股日K和历史回放放进线程，避免启动接口一直不返回。
         self._stop_flag = False
         self._cycle_count = 0
         self._last_error = None
+        self._last_cycle_at = datetime.now().strftime("%H:%M:%S") + " (正在补齐日K)"
 
         def worker():
+            self._prepare_book(watch_stocks)
             while not self._stop_flag:
                 # 一键清仓不等开盘，A 股和美股一起平
                 cleared = False
@@ -771,21 +809,28 @@ class LiveSimRunner:
                         self._last_error = None
                 except Exception as e:
                     self._last_error = f"{type(e).__name__}: {e}"
-                # A 股白天、美股美东白天各自轮询。两边都收盘才整轮跳过。
-                active = [c for c in self._loop.watch_stocks if market_is_open(c)]
+                # 开盘市场算信号并成交。北京时间白天另用日 K 算未开盘的美股，只记信号。
+                active, tradable = cycle_codes(self._loop.watch_stocks)
                 if not active:
                     if not cleared:
                         self._last_cycle_at = datetime.now().strftime("%H:%M:%S") + " (非盘中, 跳过)"
                 else:
                     try:
-                        self._loop.run_once(active)
+                        self._loop.run_once(active, trade_codes=tradable)
                         self._cycle_count += 1
-                        if all(str(c).upper().endswith(".US") for c in active):
-                            session = "美股盘中"
-                        elif any(str(c).upper().endswith(".US") for c in active):
+                        us_open = any(str(c).upper().endswith(".US") for c in tradable)
+                        a_open = any(not str(c).upper().endswith(".US") for c in tradable)
+                        us_signal = any(str(c).upper().endswith(".US") and c not in tradable for c in active)
+                        if us_open and a_open:
                             session = "A股+美股盘中"
-                        else:
+                        elif us_open:
+                            session = "美股盘中"
+                        elif a_open and us_signal:
+                            session = "A股盘中+美股信号"
+                        elif a_open:
                             session = "A股盘中"
+                        else:
+                            session = "美股信号"
                         self._last_cycle_at = datetime.now().strftime("%H:%M:%S") + f" ({session})"
                         self._last_error = None
                     except Exception as e:
@@ -799,6 +844,7 @@ class LiveSimRunner:
         self._thread = threading.Thread(target=worker, daemon=True,
                                          name="LiveSimRunner")
         self._thread.start()
+        self._starting = False
 
         mode_str = "模拟模式 (dry-run, 不连券商)" if dry_run else "实盘模式 (真实下单!)"
         # 路由表摘要 (前 5 条)
@@ -809,7 +855,35 @@ class LiveSimRunner:
                 f"     合并后监控 {len(watch_stocks)} 只: {watch_stocks}, 周期={cycle_seconds}s, "
                 f"初始持仓 {len(s.get('positions', []))} 只, 总资金 {capital:,.0f}\n"
                 f"     默认策略={self._router.default}, 路由表预览: {route_preview}\n"
-                f"     dashboard 每 5 秒自动刷新")
+                f"     美股日K和历史回放在后台进行, 页面每 5 秒刷新")
+
+    def _prepare_book(self, watch_stocks: List[str]) -> None:
+        """后台补美股日K，再回放信号和资金曲线。停掉则不再往下做。"""
+        if self._stop_flag:
+            return
+        try:
+            from lib.us_daily_sync import sync_watch_us_daily
+            sync_watch_us_daily(watch_stocks)
+        except Exception as e:
+            print(f"[us] 启动补齐美股日K失败: {type(e).__name__}: {e}", flush=True)
+        if self._stop_flag:
+            return
+        try:
+            self._seed_historical_signals_if_empty(watch_stocks)
+        except Exception as e:
+            print(f"[WARN] 历史信号回放失败: {e}", flush=True)
+        if self._stop_flag:
+            return
+        try:
+            self._seed_historical_pnl_curve_if_empty()
+        except Exception as e:
+            print(f"[WARN] 历史资金曲线回放失败: {e}", flush=True)
+        if self._stop_flag:
+            return
+        try:
+            self._seed_today_intraday_curve()
+        except Exception as e:
+            print(f"[WARN] 当日分时回放失败: {e}", flush=True)
 
     # ------------------------------------------------------------------
     def stop(self) -> str:
@@ -1331,9 +1405,10 @@ class LiveSimRunner:
 
         opening_orders = opening_buy_orders(opening, start_date, _strat)
         if all_sigs:
-            positions, fill_orders = apply_history_fills(
+            positions, fill_orders, skipped = apply_history_fills(
                 opening, capital, all_sigs, kline_map, max_slots, slot_codes,
             )
+            all_sigs = _drop_skipped_signals(all_sigs, skipped)
         else:
             positions, fill_orders = opening, []
 

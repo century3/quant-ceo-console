@@ -15,9 +15,10 @@
     - 单点入口便于做缓存 (回测 200 天评估 + 实盘 1 分钟一轮, 避免重复训练).
 
 缓存策略:
-    key = (code, last_date_str, params_hash)
+    key = (code, 首尾日期和行数, params_hash)
     - code 为 None 时禁用缓存 (WF 跑训练/评估两段不同 df, 不能复用)
-    - 同一交易日内, 实盘多次评估同一只票直接命中
+    - 同一段 K 线、同一交易日内, 实盘多次评估直接命中
+    - 模拟盘的短窗口和回测的长窗口不能共用, 否则短序列会被长序列按下标越界
     - clear_cache() 进程启动时调一次清空
 """
 
@@ -53,14 +54,18 @@ def clear_cache() -> int:
 
 
 def _make_cache_key(code: str, df: pd.DataFrame, params: Dict[str, Any]) -> Tuple[str, str, str]:
-    """缓存 key: (code, last_date, params_hash)
-    last_date 用 df 最后一根 K 的索引串, 任何新数据进来都会 miss 缓存.
+    """缓存 key: (code, 窗口, params_hash)
+
+    窗口含第一根、最后一根和行数。只认最后一根时, 模拟盘先算的短序列
+    会被同一天结束的长回测拿去用, 按下标就越界。
     params_hash 用稳定排序后的 json 摘要, 保证同参数同 hash.
     """
-    last_date = str(df.index[-1])[:19]    # 取到秒级即可, 日 K 实际只到日
+    first_date = str(df.index[0])[:19]
+    last_date = str(df.index[-1])[:19]
+    window = f"{first_date}|{last_date}|{len(df)}"
     p_str = json.dumps(params, sort_keys=True, default=str)
     p_hash = hashlib.md5(p_str.encode("utf-8")).hexdigest()[:12]
-    return (str(code), last_date, p_hash)
+    return (str(code), window, p_hash)
 
 
 # ============================================================

@@ -9,10 +9,10 @@ per_stock:
   601788.SH: macd_1d
   000612.SZ: macd_1d
   513100.SH: macd_1d
-  COHR.US: multi_factor_top
+  COHR.US: ml_xgb
   GOOG.US: chan_buy2
   IPSC.US: bias_revert
   NVDA.US: chan_grid
   RKLB.US: macd_1d
-  VOO.US: ml_xgb
+  VOO.US: boll_revert
 dragon_version: v2

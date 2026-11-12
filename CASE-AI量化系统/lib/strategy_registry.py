@@ -32,7 +32,8 @@ A 股 T+1，策略按日 K 波段，不做 5 分钟日内。
 
     [机器学习]
         - ml_xgb / ml_lgb
-          第 11 课日 K 因子 + 滚动训练。涨概率 > 0.6 买, < 0.4 卖
+          第 11 课日 K 因子 + 滚动训练。涨概率 > 0.6 买;
+          概率 < 0.4 且价格相对买价已离开 3% 才卖
 
     缠论一买、二买、三买和机器学习二买是第 13 课；缠论三买（第 9 讲）和中枢网格是另一套结构算法。
 
@@ -261,10 +262,10 @@ def strat_ma20_hold(code: str, market, capital: float) -> dict:
     name="multi_factor_top",
     label="多因子轻量 (动量+RSI+乖离)",
     group="基本面与选股",
-    description="日线 MOM_1M + RSI_14 + BIAS_20 合成 alpha, > 0.3 买, < -0.3 卖",
-    scenario="单只股票也想用「动量 + 超买超卖 + 乖离」综合打分，而不是只看一条均线时。",
-    rules="在日 K 上算三类因子并归一后取平均得到 alpha；alpha 高于阈值偏买入，低于负阈值偏卖出；中间区间观望。",
-    example="alpha 从负区间一举升到阈值之上，表示多因子同时转强，可能触发买入侧信号。",
+    description="日线 MOM_1M + RSI_14 + BIAS_20 合成 alpha, > 0.3 买, < -0.3 卖。高波动时收盘在 MA60 下不追买，跌破 MA60 直接卖。",
+    scenario="单只股票也想用「动量 + 超买超卖 + 乖离」综合打分，而不是只看一条均线时。波动大的票还要避开下跌趋势。",
+    rules="三个因子归一后取平均得到 alpha，高于 0.30 买，低于 -0.30 卖。20 日收益波动年化达到 40% 视为高波动：收盘在 MA60 下方不追反弹，刚跌破 MA60 则卖出。",
+    example="高波动股票反弹把 alpha 抬过 0.30，但收盘仍在 MA60 下，这时不买。收盘刚跌破 MA60 则离场，不等 21 日跌幅扩大。",
 )
 def strat_multi_factor(code: str, market, capital: float) -> dict:
     df = _safe_kline(market, code, "1d", 200)
@@ -303,6 +304,24 @@ def strat_multi_factor(code: str, market, capital: float) -> dict:
     alpha = (f_mom + f_rsi + f_bias) / 3
     reason = (f"MOM_1M={mom_1m:+.2%} RSI={rsi:.1f} BIAS={bias:+.2%} "
               f"-> alpha={alpha:+.2f}")
+
+    # 波动大的票在下跌趋势里不追反弹。20 日收益波动年化 >= 40%，
+    # 且收盘在 MA60 下：刚跌破就卖，已经在均线下则禁止把反弹当成买点。
+    if len(close) >= 61:
+        ma60 = close.rolling(60).mean()
+        vol = float(close.pct_change().iloc[-20:].std() * (252 ** 0.5))
+        below = float(close.iloc[-1]) < float(ma60.iloc[-1])
+        prev_below = float(close.iloc[-2]) < float(ma60.iloc[-2])
+        if vol >= 0.40 and below and not prev_below:
+            return _signal(
+                "sell", "multi_factor_top",
+                reason + f" | 20日波动{vol:.0%}跌破MA60, 下跌趋势离场",
+            )
+        if vol >= 0.40 and below and alpha > 0.30:
+            return _hold(
+                "multi_factor_top",
+                reason + f" | 20日波动{vol:.0%}且收盘在MA60下, 不追反弹",
+            )
 
     if alpha > 0.30:
         return _signal("buy", "multi_factor_top", reason)
@@ -1211,44 +1230,130 @@ def strat_fund_quality(code: str, market, capital: float) -> dict:
     return _signal("sell", "fund_quality", "漏斗未过 " + reason)
 
 
-def _ml_last_prob(code: str, market, model_type: str):
-    """回测读已算好的序列; 模拟盘当场滚动训练, 按最后一根 K 缓存。"""
+# 概率带到 0.6 以上才买。卖出要概率掉到 0.4 以下，并且价格相对买价已经离开 3%。
+# 没离开就继续拿着，避免 307 买、307.5 卖这种没有价差的来回。
+ML_BUY_TH = 0.60
+ML_SELL_TH = 0.40
+ML_MIN_MOVE = 0.03
+
+
+def ml_roundtrip_too_small(strategy: str, cost: float, price: float) -> bool:
+    """概率择时的卖出价离持仓成本不到 3% 时，这笔卖出会变成同价来回。"""
+    if strategy not in ML_MODELS:
+        return False
+    if cost <= 0 or price <= 0:
+        return False
+    return abs(price / cost - 1.0) < ML_MIN_MOVE
+
+
+def _ml_frame(code: str, market, model_type: str):
+    """日 K，以及和它对齐的涨跌概率。不够训练时返回空。"""
     df = _safe_kline(market, code, "1d", 400)
     if df is None or len(df) < 150:
         return None
     attached = getattr(market, "ml_prob", None)
-    if attached is not None:
-        ts = df.index[-1]
-        if ts in attached.index:
-            val = attached.loc[ts]
-            if hasattr(val, "iloc"):
-                val = val.iloc[-1]
-            return float(val)
+    if attached is None:
+        from ml_strategy.ml_prob_runner import run_ml_prob
+        attached = run_ml_prob(
+            df, model_type=model_type, code=code, verbose=False,
+        )["prob_series"]
+    prob = attached.reindex(df.index)
+    start = ""
+    bt = getattr(market, "_strategy", None)
+    if bt is not None:
+        start = str(getattr(bt.p, "start_date", "") or "")
+    if start:
+        ts = pd.Timestamp(start)
+        df = df.loc[df.index >= ts]
+        prob = prob.reindex(df.index)
+    if df is None or df.empty:
         return None
-    from ml_strategy.ml_prob_runner import run_ml_prob
-    out = run_ml_prob(df, model_type=model_type, code=code, verbose=False)
-    return float(out["meta"]["last_prob"])
+    return df, prob
+
+
+def _ml_bar_prob(raw) -> Optional[float]:
+    if raw is None or pd.isna(raw):
+        return None
+    if hasattr(raw, "iloc"):
+        raw = raw.iloc[-1]
+        if pd.isna(raw):
+            return None
+    val = float(raw)
+    if math.isnan(val):
+        return None
+    return val
 
 
 def _ml_signal(code: str, market, name: str, model_type: str) -> dict:
-    prob = _ml_last_prob(code, market, model_type)
-    if prob is None:
+    """有模型仓位才卖。概率低于 0.4 但价格还贴着买价时继续持有。
+    卖出条件已经成立时，概率回到 0.4 以上之前继续给卖出，没成交的下一轮还能卖。
+    """
+    frame = _ml_frame(code, market, model_type)
+    if frame is None:
         return _hold(name, "概率未就绪 (日 K 需约 150 根)")
-    if prob > 0.6:
-        return _signal("buy", name, f"涨概率 {prob:.3f} > 0.6")
-    if prob < 0.4:
-        return _signal("sell", name, f"涨概率 {prob:.3f} < 0.4")
-    return _hold(name, f"涨概率 {prob:.3f} 中性")
+    df, prob = frame
+    close = df["close"].astype(float)
+    in_pos = False
+    armed_exit = False
+    entry = 0.0
+    action = "hold"
+    reason = "概率未就绪 (日 K 需约 150 根)"
+    for i in range(len(close)):
+        p = _ml_bar_prob(prob.iloc[i])
+        if p is None:
+            continue
+        px = float(close.iloc[i])
+        last = i == len(close) - 1
+        if not in_pos and p > ML_BUY_TH:
+            in_pos = True
+            armed_exit = False
+            entry = px
+            if last:
+                action = "buy"
+                reason = f"涨概率 {p:.3f} > {ML_BUY_TH:.1f}"
+        elif in_pos and entry > 0 and p < ML_SELL_TH:
+            move = px / entry - 1.0
+            if abs(move) >= ML_MIN_MOVE:
+                in_pos = False
+                armed_exit = True
+                entry = 0.0
+                if last:
+                    action = "sell"
+                    reason = (
+                        f"涨概率 {p:.3f} < {ML_SELL_TH:.1f}, 相对买价 {move:+.1%}"
+                    )
+            elif last:
+                action = "hold"
+                reason = (
+                    f"涨概率 {p:.3f} < {ML_SELL_TH:.1f}, "
+                    f"相对买价仅 {move:+.1%}, 不足 3% 不卖"
+                )
+        elif not in_pos and p >= ML_SELL_TH:
+            armed_exit = False
+            if last:
+                action = "hold"
+                reason = f"涨概率 {p:.3f} 中性"
+        elif last and armed_exit and p < ML_SELL_TH:
+            action = "sell"
+            reason = f"涨概率 {p:.3f} < {ML_SELL_TH:.1f}, 卖出尚未完成"
+        elif last:
+            action = "hold"
+            reason = f"涨概率 {p:.3f} 持有"
+    if action == "buy":
+        return _signal("buy", name, reason)
+    if action == "sell":
+        return _signal("sell", name, reason)
+    return _hold(name, reason)
 
 
 @register(
     name="ml_xgb",
     label="XGBoost 概率择时",
     group="机器学习",
-    description="50 多个日 K 因子加 XGBoost 滚动训练, 概率高于 0.6 买、低于 0.4 卖。第 11 讲。",
+    description="50 多个日 K 因子加 XGBoost 滚动训练。概率高于 0.6 买；低于 0.4 且价格相对买价已离开 3% 才卖。第 11 讲。",
     scenario="用课上的树模型做波段, 并和规则策略对照时。",
-    rules="训练窗口 120 个交易日, 每 20 日重训。预测下一交易日涨跌。回测整段只训一轮; 模拟盘同一天命中缓存。",
-    example="最新概率 0.72 买入; 落到 0.35 卖出。",
+    rules="训练窗口 120 个交易日, 每 20 日重训。预测下一交易日涨跌。没开过模型仓不卖。概率掉到 0.4 以下但涨跌不足 3% 时继续持有。回测整段只训一轮; 模拟盘同一天命中缓存。",
+    example="最新概率 0.72 买入; 落到 0.35 且价格已离开买价 3% 则卖出。价格还在买价附近则继续拿着。",
 )
 def strat_ml_xgb(code: str, market, capital: float) -> dict:
     return _ml_signal(code, market, "ml_xgb", "xgboost")
@@ -1258,10 +1363,10 @@ def strat_ml_xgb(code: str, market, capital: float) -> dict:
     name="ml_lgb",
     label="LightGBM 概率择时",
     group="机器学习",
-    description="和 XGBoost 同一套因子与阈值, 模型换成 LightGBM。第 11 讲对照。",
+    description="和 XGBoost 同一套因子、阈值和 3% 价差过滤, 模型换成 LightGBM。第 11 讲对照。",
     scenario="和 XGBoost 并排回测, 看两棵树模型谁更稳。",
-    rules="概率高于 0.6 买、低于 0.4 卖。回测整段只训一轮。",
-    example="LightGBM 概率 0.68 买入。",
+    rules="概率高于 0.6 买。低于 0.4 且价格相对买价已离开 3% 才卖。回测整段只训一轮。",
+    example="LightGBM 概率 0.68 买入; 落到 0.35 且价格已离开买价 3% 则卖出。",
 )
 def strat_ml_lgb(code: str, market, capital: float) -> dict:
     return _ml_signal(code, market, "ml_lgb", "lightgbm")

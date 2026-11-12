@@ -493,6 +493,22 @@ def apply_dry_run_fill(positions: List[dict], code: str, side: str,
 
 
 
+def _same_signal_today(signals: list, sig: dict, today: str) -> bool:
+    """这只股票今天最近一条是否已经是同一方向、同一策略、同一原因。"""
+    code = sig.get("code")
+    for old in reversed(signals):
+        if old.get("code") != code:
+            continue
+        if not str(old.get("ts") or "").startswith(today):
+            return False
+        return (
+            old.get("side") == sig.get("side")
+            and (old.get("strategy") or "") == (sig.get("strategy") or "")
+            and (old.get("reason") or "") == (sig.get("reason") or "")
+        )
+    return False
+
+
 # ============================================================
 # 主循环
 # ============================================================
@@ -544,11 +560,18 @@ class LiveTradingLoop:
     # ------------------------------------------------------------------
     # 单次循环
     # ------------------------------------------------------------------
-    def run_once(self, active_codes: Optional[List[str]] = None) -> dict:
-        """跑一次完整循环。active_codes 只处理当前开盘的代码，空则用全部监控。"""
+    def run_once(self, active_codes: Optional[List[str]] = None,
+                 trade_codes: Optional[List[str]] = None) -> dict:
+        """跑一次完整循环。
+
+        active_codes 是本轮要算信号的代码，空则用全部监控。
+        trade_codes 是其中允许下单的代码；不传则全部可下单。
+        北京时间白天会把未开盘的美股放进 active_codes、不放进 trade_codes，只记信号。
+        """
         cycle_start = time.time()
         s = self.state_store.load()
         codes = list(self.watch_stocks if active_codes is None else active_codes)
+        tradable = set(codes if trade_codes is None else trade_codes)
 
         # 0) 检查 control.trading_status
         if s.get("trading_status") == "HALTED":
@@ -649,7 +672,11 @@ class LiveTradingLoop:
         # save(s) 用旧快照整体覆盖回去, 导致 signals / orders 写完即丢
         if new_signals:
             s["signals"] = s.get("signals", [])
+            today = datetime.now().strftime("%Y-%m-%d")
             for sig in new_signals:
+                # 盘外美股同一条信号当天只记一次，避免每分钟刷满信号表
+                if sig["code"] not in tradable and _same_signal_today(s["signals"], sig, today):
+                    continue
                 s["signals"].append({
                     **sig,
                     "ts": datetime.now().isoformat(timespec="seconds"),
@@ -660,10 +687,12 @@ class LiveTradingLoop:
                 )
             s["signals"] = s["signals"][-100:]
 
-        # 5) 风控 + 下单
+        # 5) 风控 + 下单。未开盘的美股只留信号，不模拟成交。
         # skipped / 无仓可卖 不写流水 (水平策略每轮都会给同向信号, 写了会刷屏)
         s["orders"] = s.get("orders", [])
         for sig in new_signals:
+            if sig["code"] not in tradable:
+                continue
             order_result = self._handle_signal(s, sig)
             # 把触发该订单的策略名一起记录, 便于复盘
             if "strategy" not in order_result and sig.get("strategy"):
@@ -715,6 +744,19 @@ class LiveTradingLoop:
             return {"code": code, "side": side, "quantity": 0, "price": price,
                     "status": "rejected", "reason": "无持仓可卖",
                     "ts": datetime.now().isoformat()}
+        if side == "sell":
+            from lib.strategy_registry import ml_roundtrip_too_small
+            cost = 0.0
+            for p in positions:
+                if p.get("code") == code and int(p.get("volume") or 0) > 0:
+                    cost = float(p.get("cost") or 0)
+                    break
+            if ml_roundtrip_too_small(str(signal.get("strategy") or ""), cost, price):
+                move = price / cost - 1.0
+                return {"code": code, "side": side, "quantity": 0, "price": price,
+                        "status": "skipped",
+                        "reason": f"相对成本 {cost:.2f} 仅 {move:+.1%}, 不足 3% 不卖",
+                        "ts": datetime.now().isoformat()}
 
         # 记名档位: 未分档不买; 已分档按每档目标金额开; 卖出一口卖光, 档还在
         if side == "sell":
